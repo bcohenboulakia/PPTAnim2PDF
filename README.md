@@ -8,6 +8,19 @@
 
 The main difference between the two is that PPTAnim2PDF is a standalone script that directly parses and rewrites the `.pptx` OOXML package, using only open-source, cross-platform dependencies. PPspliT takes a different approach: it runs inside PowerPoint and relies on its VBA object model to interpret and transform slides. For standard desktop use, PPspliT remains the safer default, because it stays closer to PowerPoint’s native handling of the file. PPTAnim2PDF is designed for workflows where relying on PowerPoint is undesirable or impossible, such as batch or headless conversion. I created it to automate this conversion step so that I could integrate it into the CI/CD workflow I use to maintain the course materials in my Git repository (see my [nbworkshop repository](https://github.com/bcohenboulakia/nbworkshop)).
 
+## Usage
+
+```bash
+pptanim2pdf.py [-h] [-o OUTPUT] [--report {none,summary,detail}] input
+```
+
+Convert an animated PPTX into a static PPTX with one slide per animation state.
+
+- `input`: Input PPTX file.
+- `-h`, `--help`: Show this help message and exit.
+- `-o OUTPUT`, `--output OUTPUT`: Output PPTX file. If omitted, `_split` is appended to the input file name.
+- `--report {none,summary,detail}`, `--report-level {none,summary,detail}`: Report detail level: `none` = no report, `summary` = concise report, `detail` = detailed report.
+
 ## Compatibility
 
 PPTAnim2PDF is intended for `.pptx` files produced by Microsoft PowerPoint 2007 or later, with best-effort support for recent PowerPoint desktop versions on Windows and macOS.
