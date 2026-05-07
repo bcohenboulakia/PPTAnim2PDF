@@ -30,7 +30,7 @@ on:
           - detail
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -179,8 +179,26 @@ jobs:
 
           exit "$STATUS"
 
-      - name: Upload converted file
-        uses: actions/upload-artifact@v4
-        with:
-          name: converted-presentation
-          path: ${{ steps.paths.outputs.output }}
+      - name: Commit generated file
+        shell: bash
+        run: |
+          OUTPUT="${{ steps.paths.outputs.output }}"
+
+          if [ ! -f "$OUTPUT" ]; then
+            echo "Generated file not found: $OUTPUT"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "$OUTPUT"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit for $OUTPUT."
+            exit 0
+          fi
+
+          git commit -m "Generate converted presentation"
+
+          git push
