@@ -45,6 +45,7 @@ jobs:
 
       - name: Compute image tag
         id: meta
+        shell: bash
         run: |
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           REPO="${GITHUB_REPOSITORY#*/}"
@@ -72,6 +73,7 @@ jobs:
 
       - name: Check whether image already exists
         id: check
+        shell: bash
         run: |
           if docker manifest inspect "${{ steps.meta.outputs.image }}" > /dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -94,17 +96,19 @@ jobs:
     needs: prepare-image
     runs-on: ubuntu-latest
 
-    container:
-      image: ${{ needs.prepare-image.outputs.image }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
     steps:
       - uses: actions/checkout@v4
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Compute output path
         id: paths
+        shell: bash
         run: |
           INPUT="${{ inputs.input }}"
           OUTPUT="${{ inputs.output }}"
@@ -131,12 +135,49 @@ jobs:
           echo "Format: $FORMAT"
 
       - name: Convert presentation
+        id: convert
+        shell: bash
         run: |
-          pptanim2pdf \
+          set +e
+
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            "${{ needs.prepare-image.outputs.image }}" \
             "${{ steps.paths.outputs.input }}" \
             --format="${{ steps.paths.outputs.format }}" \
             -o "${{ steps.paths.outputs.output }}" \
-            --report="${{ inputs.report }}"
+            --report="${{ inputs.report }}" \
+            > conversion-report.txt 2>&1
+
+          STATUS=$?
+
+          cat conversion-report.txt
+
+          {
+            echo "## PPTAnim2PDF conversion"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Input | \`${{ steps.paths.outputs.input }}\` |"
+            echo "| Output | \`${{ steps.paths.outputs.output }}\` |"
+            echo "| Format | \`${{ steps.paths.outputs.format }}\` |"
+            echo "| Report level | \`${{ inputs.report }}\` |"
+            echo "| Status | \`$STATUS\` |"
+            echo
+
+            if [ -s conversion-report.txt ]; then
+              echo "### Converter report"
+              echo
+              echo '```text'
+              cat conversion-report.txt
+              echo '```'
+            else
+              echo "No converter report was produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$STATUS"
 
       - name: Upload converted file
         uses: actions/upload-artifact@v4
