@@ -1,3 +1,7 @@
+# =============================================================================
+# Imports, namespaces, and constants
+# =============================================================================
+
 import argparse
 import copy
 import posixpath
@@ -59,9 +63,12 @@ FILL_TAGS = {
 }
 
 
+# =============================================================================
+# XML and OOXML helpers
+# =============================================================================
+
 def parse_xml(data):
     return etree.fromstring(data)
-
 
 def xml_bytes(root):
     return etree.tostring(
@@ -80,7 +87,6 @@ def remove_timing_and_transition(slide_root):
         if el.tag in {qn(P, "timing"), qn(P, "transition")}:
             slide_root.remove(el)
 
-
 def is_inside_mc_fallback(el):
     cur = el.getparent()
 
@@ -94,6 +100,47 @@ def is_inside_mc_fallback(el):
 
     return False
 
+def clean_slide_rels(rels_data):
+    if rels_data is None:
+        root = etree.Element(qn(REL, "Relationships"))
+        return xml_bytes(root)
+
+    root = parse_xml(rels_data)
+
+    for rel in list(root):
+        rel_type = rel.get("Type", "")
+
+        if rel_type.endswith(("/notesSlide", "/comments", "/commentAuthors")):
+            root.remove(rel)
+
+    return xml_bytes(root)
+
+def next_free_rid(used):
+    i = 1
+
+    while True:
+        rid = f"rId{i}"
+
+        if rid not in used:
+            used.add(rid)
+            return rid
+
+        i += 1
+
+def presentation_slide_size(pres_root):
+    sld_sz = pres_root.find("./p:sldSz", namespaces=NS)
+
+    if sld_sz is None:
+        # Default PowerPoint widescreen size: 13.333 x 7.5 inches.
+        return 12192000, 6858000
+
+    return int(sld_sz.get("cx")), int(sld_sz.get("cy"))
+
+
+
+# =============================================================================
+# Shape and target discovery
+# =============================================================================
 
 def all_shape_elements(slide_root):
     result = {}
@@ -126,10 +173,8 @@ def all_shape_elements(slide_root):
 
     return result
 
-
 def paragraphs_of_shape(shape_el):
     return shape_el.xpath(".//p:txBody/a:p", namespaces=NS)
-
 
 def target_from_behavior(cbhvr):
     targets = []
@@ -158,7 +203,6 @@ def target_from_behavior(cbhvr):
 
     return [("paragraph", sid, i) for i in range(start, end + 1)]
 
-
 def dedup_targets(targets):
     seen = set()
     out = []
@@ -170,11 +214,17 @@ def dedup_targets(targets):
 
     return out
 
+
+
+# =============================================================================
+# Animation value parsing
+# =============================================================================
+
 def parse_motion_path_numbers(path):
     """
-    Extrait commandes et nombres depuis un path PowerPoint.
-
-    Exemple typique :
+    Extract commands and numbers from a PowerPoint motion path.
+    
+    Typical example:
         M 0 0 L 0.25 0 E
     """
     if not path:
@@ -186,20 +236,19 @@ def parse_motion_path_numbers(path):
 
     return token_re.findall(path)
 
-
 def final_point_from_motion_path(path):
     """
-    Retourne le déplacement final normalisé (dx, dy) d'un motion path.
-
-    Les coordonnées PowerPoint de motion path sont généralement exprimées
-    comme fractions de la taille de la slide. Par exemple, x=0.25 signifie
-    environ un quart de largeur de slide.
-
-    On ne conserve que le point final :
-    - L : dernier point du segment ;
-    - C : dernier point de la courbe ;
-    - Z : retour au point initial du chemin ;
-    - E : fin.
+    Return the normalized final displacement (dx, dy) of a motion path.
+    
+    PowerPoint motion path coordinates are usually expressed as fractions of
+    the slide size. For example, x=0.25 means approximately one quarter of the
+    slide width.
+    
+    Only the final point is kept:
+    - L: last point of the segment;
+    - C: last point of the curve;
+    - Z: return to the initial point of the path;
+    - E: end.
     """
     tokens = parse_motion_path_numbers(path)
 
@@ -216,7 +265,7 @@ def final_point_from_motion_path(path):
     def read_float():
         nonlocal i
         if i >= len(tokens):
-            raise ValueError("motion path incomplet")
+            raise ValueError("incomplete motion path")
 
         value = float(tokens[i])
         i += 1
@@ -259,7 +308,7 @@ def final_point_from_motion_path(path):
             last_point = current
 
         elif cmd_lower == "c":
-            # Courbe de Bézier : trois points, le dernier est l'arrivée.
+            # Bezier curve: three points, the last one is the end point.
             coords = []
 
             for _ in range(3):
@@ -289,17 +338,17 @@ def final_point_from_motion_path(path):
 
 def motion_delta_from_anim_motion(anim_motion, slide_width, slide_height):
     """
-    Convertit un p:animMotion en déplacement EMU.
-
-    Retourne :
+    Convert a p:animMotion element to an EMU displacement.
+    
+    Returns:
         ((dx, dy), None)
-    ou :
+    or:
         (None, "closed_or_zero_motion_paths")
         (None, "unsupported_motion_paths")
-
-    Un motion path dont le point final est identique au point initial
-    est une animation purement dynamique : elle ne peut pas être rendue
-    par un changement de slide statique.
+    
+    A motion path whose final point is identical to its initial point is a
+    purely dynamic animation: it cannot be rendered as a distinct static slide
+    state.
     """
     path = anim_motion.get("path")
 
@@ -323,10 +372,10 @@ def motion_delta_from_anim_motion(anim_motion, slide_width, slide_height):
 
 def scale_value_to_factor(value):
     """
-    Convertit une valeur OOXML de scale en facteur Python.
-
-    Dans les animations PowerPoint, 100000 correspond à 100%.
-    Donc :
+    Convert an OOXML scale value to a Python factor.
+    
+    In PowerPoint animations, 100000 corresponds to 100%.
+    So:
       150000 -> 1.5
        50000 -> 0.5
     """
@@ -343,19 +392,18 @@ def scale_value_to_factor(value):
 
     return float(raw) / 100000.0
 
-
 def scale_factor_from_anim_scale(anim_scale):
     """
-    Convertit un p:animScale en facteur de scale final.
-
-    Retourne :
+    Convert a p:animScale element to a final scale factor.
+    
+    Returns:
         ((sx, sy), None)
-    ou :
+    or:
         (None, "unsupported_scale_animations")
         (None, "neutral_scale_animations")
-
-    Pour Grow/Shrink, PowerPoint encode généralement le facteur dans
-    p:by ou p:to avec x/y en cent-millièmes de pourcentage.
+    
+    For Grow/Shrink, PowerPoint usually encodes the factor in p:by or p:to with
+    x/y values expressed in hundred-thousandths of a percent.
     """
     scale_node = None
 
@@ -395,18 +443,17 @@ def scale_factor_from_anim_scale(anim_scale):
 def clamp_alpha(alpha):
     return max(0, min(100000, int(round(alpha))))
 
-
 def opacity_value_to_alpha(value, value_is_transparency=False):
     """
-    Convertit une valeur d'animation en alpha OOXML.
-
-    alpha OOXML :
+    Convert an animation value to an OOXML alpha value.
+    
+    OOXML alpha:
       100000 -> opaque
        50000 -> 50% opaque
            0 -> invisible
-
-    Si value_is_transparency=True, la valeur est interprétée comme un
-    pourcentage de transparence et convertie en opacité.
+    
+    If value_is_transparency=True, the value is interpreted as a transparency
+    percentage and converted to opacity.
     """
     if value is None:
         return None
@@ -438,14 +485,13 @@ def opacity_value_to_alpha(value, value_is_transparency=False):
 
     return clamp_alpha(fixed)
 
-
 def final_value_from_anim(anim):
     """
-    Récupère une valeur finale dans un p:anim.
-
-    PowerPoint peut encoder certains effets via :
-    - p:to ;
-    - p:tavLst / p:tav, avec la dernière valeur de la séquence.
+    Read a final value from a p:anim element.
+    
+    PowerPoint may encode some effects through:
+    - p:to;
+    - p:tavLst / p:tav, using the last value in the sequence.
     """
     value_paths = [
         "./p:to/p:strVal/@val",
@@ -476,20 +522,19 @@ def final_value_from_anim(anim):
 
     return None
 
-
 def opacity_alpha_from_anim(anim):
     """
-    Détecte une animation de transparence/opacité et renvoie l'alpha final.
-
-    Cas attendu pour l'effet Transparency :
-    - attrName contenant opacity ;
-    - valeur finale dans p:to ou p:tavLst.
-
-    Retourne :
+    Detect a transparency/opacity animation and return the final alpha value.
+    
+    Expected case for the Transparency effect:
+    - attrName contains opacity;
+    - final value in p:to or p:tavLst.
+    
+    Returns:
         (alpha, None)
-    ou :
-        (None, None) si ce n'est pas une animation d'opacité
-    ou :
+    or:
+        (None, None) if this is not an opacity animation
+    or:
         (None, "unsupported_opacity_animations")
     """
     attr_names = [
@@ -524,9 +569,9 @@ def opacity_alpha_from_anim(anim):
 
 def rotation_value_to_ooxml(value):
     """
-    Convertit une valeur de rotation OOXML en entier.
-
-    Les rotations PowerPoint sont exprimées en 1/60000e de degré :
+    Convert an OOXML rotation value to an integer.
+    
+    PowerPoint rotations are expressed in 1/60000th of a degree:
       90°  ->  5400000
       360° -> 21600000
     """
@@ -538,38 +583,36 @@ def rotation_value_to_ooxml(value):
     if not raw:
         return None
 
-    # Cas pratique si un export produit une valeur lisible en degrés.
+    # Practical case if an export produces a readable degree value.
     if raw.endswith("deg"):
         return int(round(float(raw[:-3]) * 60000))
 
     return int(round(float(raw)))
 
-
 def normalize_rotation(rot):
     """
-    Normalise une rotation pour éviter les valeurs énormes.
-
-    Visuellement, 0°, 360° et 720° sont équivalents.
+    Normalize a rotation to avoid very large values.
+    
+    Visually, 0°, 360°, and 720° are equivalent.
     """
     return rot % FULL_TURN
 
-
 def rotation_transform_from_anim_rot(anim_rot):
     """
-    Convertit un p:animRot en transformation de rotation.
-
-    Retourne :
+    Convert a p:animRot element to a rotation transform.
+    
+    Returns:
         ({"rotation_mode": "delta", "rot": value}, None)
         ({"rotation_mode": "absolute", "rot": value}, None)
-
-    ou :
+    
+    or:
         (None, "unsupported_rotation_animations")
         (None, "neutral_rotation_animations")
-
-    Règles :
-    - by : rotation relative à l'état courant ;
-    - to : rotation finale absolue ;
-    - from + to : on garde l'état final absolu to.
+    
+    Rules:
+    - by: rotation relative to the current state;
+    - to: absolute final rotation;
+    - from + to: keep the absolute final state given by to.
     """
     by_value = rotation_value_to_ooxml(anim_rot.get("by"))
     to_value = rotation_value_to_ooxml(anim_rot.get("to"))
@@ -597,8 +640,8 @@ def rotation_transform_from_anim_rot(anim_rot):
 
 def visibility_action_from_effect_container(ctn):
     """
-    Réduit une animation PowerPoint à son effet statique final.
-    On garde uniquement la sémantique apparition/disparition.
+    Reduce a PowerPoint animation to its final static effect.
+    Only the appear/disappear semantics are kept.
     """
     preset = ctn.get("presetClass")
 
@@ -641,17 +684,18 @@ def visibility_action_from_effect_container(ctn):
 
 def has_nonzero_delay(ctn):
     """
-    Détecte un délai explicite sur l'effet.
-
-    La plupart du temps, le délai est directement sur le cTn de l'effet :
+    Detect an explicit delay on the effect.
+    
+    Most of the time, the delay is directly on the effect cTn:
         p:cTn / p:stCondLst / p:cond delay="..."
-
-    On garde un fallback descendant pour certains encodages PowerPoint.
+    
+    A descendant fallback is kept for some PowerPoint encodings.
     """
     delays = ctn.xpath("./p:stCondLst/p:cond/@delay", namespaces=NS)
 
     if not delays:
-        delays = ctn.xpath(".//p:cBhvr/p:cTn/p:stCondLst/p:cond/@delay", namespaces=NS)
+        delays = ctn.xpath(".//p:cBhvr/p:cTn/p:stCondLst/p:cond/@delay",
+                           namespaces=NS)
 
     for raw_delay in delays:
         delay = str(raw_delay).strip().lower()
@@ -665,16 +709,16 @@ def has_nonzero_delay(ctn):
 
 def step_for_effect(node_type, ctn, current_step):
     """
-    Convertit les déclenchements PowerPoint en étapes statiques.
-
-    Règles :
-    - clickEffect : nouvelle étape.
-    - afterEffect après une étape existante : nouvelle étape.
-    - withEffect sans délai : même étape.
-    - withEffect avec délai : nouvelle étape.
-    - effet automatique à délai 0 avant toute étape : étape 0.
-
-    L'étape 0 correspond à l'état immédiatement affiché de la slide.
+    Convert PowerPoint triggers to static steps.
+    
+    Rules:
+    - clickEffect: new step.
+    - afterEffect after an existing step: new step.
+    - withEffect without delay: same step.
+    - withEffect with delay: new step.
+    - automatic effect with delay 0 before any step: step 0.
+    
+    Step 0 corresponds to the state immediately displayed by the slide.
     """
     has_delay = has_nonzero_delay(ctn)
 
@@ -695,71 +739,12 @@ def step_for_effect(node_type, ctn, current_step):
 
     return current_step + 1
 
-def text_style_kind_from_attr_name(attr_name):
-    name = attr_name.strip().lower()
-
-    if name == "style.fontweight":
-        return "bold"
-
-    if name == "style.fontstyle":
-        return "italic"
-
-    if name == "style.textdecorationunderline":
-        return "underline"
-
-    if name == "style.textdecorationlinethrough":
-        return "strike"
-
-    return None
-
-
-def container_has_supported_text_style(ctn):
-    attr_names = [
-        t.strip()
-        for t in ctn.xpath(".//p:attrName/text()", namespaces=NS)
-        if t and t.strip()
-    ]
-
-    return any(
-        text_style_kind_from_attr_name(attr_name) is not None
-        for attr_name in attr_names
-    )
-
-def unsupported_text_animation_kind(ctn):
-    """
-    Détecte les animations de texte plus fines que le paragraphe.
-
-    Les effets de style/couleur texte que l'on sait aplatir sont acceptés,
-    même si PowerPoint les encode avec p:iterate type="lt" ou "wd".
-    """
-    if container_has_supported_text_or_color_effect(ctn):
-        return None
-
-    iterate_nodes = ctn.xpath(
-        "./p:iterate | ancestor::p:cTn/p:iterate",
-        namespaces=NS,
-    )
-
-    for iterate in iterate_nodes:
-        iterate_type = iterate.get("type", "el").strip().lower()
-
-        if iterate_type == "wd":
-            return "word"
-
-        if iterate_type == "lt":
-            return "letter"
-
-    if ctn.xpath(".//p:tgtEl/p:spTgt/p:txEl/p:charRg", namespaces=NS):
-        return "character"
-
-    return None
-
 def ordered_transform_nodes_from_container(ctn):
     """
-    Retourne les nœuds de transformation dans l'ordre XML réel.
-
-    Les nœuds dans p:subTnLst sont exclus : ils correspondent à des
-    effets post-animation, comme Dim after animation.
+    Return transform nodes in their actual XML order.
+    
+    Nodes inside p:subTnLst are excluded: they correspond to post-animation
+    effects, such as Dim after animation.
     """
     preset = ctn.get("presetClass")
 
@@ -788,28 +773,74 @@ def ordered_transform_nodes_from_container(ctn):
 
     return []
 
-def color_key(color_el):
+
+
+# =============================================================================
+# Color and text animation parsing
+# =============================================================================
+
+def text_style_kind_from_attr_name(attr_name):
+    name = attr_name.strip().lower()
+
+    if name == "style.fontweight":
+        return "bold"
+
+    if name == "style.fontstyle":
+        return "italic"
+
+    if name == "style.textdecorationunderline":
+        return "underline"
+
+    if name == "style.textdecorationlinethrough":
+        return "strike"
+
+    return None
+
+def container_has_supported_text_style(ctn):
+    attr_names = [
+        t.strip()
+        for t in ctn.xpath(".//p:attrName/text()", namespaces=NS)
+        if t and t.strip()
+    ]
+
+    return any(
+        text_style_kind_from_attr_name(attr_name) is not None
+        for attr_name in attr_names
+    )
+
+def unsupported_text_animation_kind(ctn):
     """
-    Clé normalisée pour comparer deux couleurs.
-
-    Exemples :
-      <a:srgbClr val="FF0000"/>    -> ("srgbClr", "FF0000")
-      <a:schemeClr val="accent1"/> -> ("schemeClr", "accent1")
+    Detect text animations that are finer than a paragraph.
+    
+    Supported text style/color effects are accepted, even when PowerPoint
+    encodes them with p:iterate type="lt" or "wd".
     """
-    if color_el is None:
-        return ("unknown", None)
+    if container_has_supported_text_or_color_effect(ctn):
+        return None
 
-    if color_el == "none":
-        return ("none", None)
+    iterate_nodes = ctn.xpath(
+        "./p:iterate | ancestor::p:cTn/p:iterate",
+        namespaces=NS,
+    )
 
-    q = etree.QName(color_el)
-    return (q.localname, color_el.get("val"))
+    for iterate in iterate_nodes:
+        iterate_type = iterate.get("type", "el").strip().lower()
+
+        if iterate_type == "wd":
+            return "word"
+
+        if iterate_type == "lt":
+            return "letter"
+
+    if ctn.xpath(".//p:tgtEl/p:spTgt/p:txEl/p:charRg", namespaces=NS):
+        return "character"
+
+    return None
 
 
 def color_from_color_container(container_el):
     """
-    Récupère la première couleur DrawingML contenue dans un élément
-    p:from / p:to / p:by.
+    Return the first DrawingML color contained in a p:from / p:to / p:by element.
     """
     if container_el is None:
         return None
@@ -820,21 +851,19 @@ def color_from_color_container(container_el):
 
     return None
 
-
 def color_from_anim_clr_child(anim_clr, child_name):
     child = anim_clr.find(f"./p:{child_name}", namespaces=NS)
     return color_from_color_container(child)
 
-
 def color_kind_from_anim_clr(anim_clr):
     """
-    Détermine la cible d'un p:animClr.
-
-    Encodages attendus :
-    - fillcolor    -> remplissage
-    - stroke.color -> contour
-    - style.color  -> couleur de texte
-    - ppt_c        -> couleur de texte, utilisé notamment par Dim after animation
+    Determine the target of a p:animClr element.
+    
+    Expected encodings:
+    - fillcolor    -> fill;
+    - stroke.color -> line;
+    - style.color  -> text color;
+    - ppt_c        -> text color, notably used by Dim after animation.
     """
     attr_names = [
         t.strip().lower()
@@ -856,16 +885,16 @@ def color_kind_from_anim_clr(anim_clr):
 
 def color_transition_from_anim_clr(anim_clr):
     """
-    Convertit un p:animClr en transition de couleur.
-
-    Retourne :
+    Convert a p:animClr element to a color transition.
+    
+    Returns:
         ({
             "color_kind": "fill" | "line" | "text",
             "from_color": color_or_None,
             "to_color": color,
         }, None)
-
-    ou :
+    
+    or:
         (None, "unsupported_color_animations")
     """
     color_kind = color_kind_from_anim_clr(anim_clr)
@@ -927,17 +956,17 @@ def boolean_text_style_value(raw_value, style_kind):
 
 def text_style_change_from_anim(anim):
     """
-    Détecte les effets texte discrets :
+    Detect discrete text effects:
     - Bold
     - Italic
     - Underline
     - Strikethrough
-
-    Retourne :
+    
+    Returns:
         ({"text_style": kind, "value": bool}, None)
-    ou :
-        (None, None) si ce n'est pas un effet texte reconnu
-    ou :
+    or:
+        (None, None) if this is not a recognized text effect
+    or:
         (None, "unsupported_text_style_animations")
     """
     attr_names = [
@@ -976,14 +1005,13 @@ def attr_names_from_animation_node(node):
         if t and t.strip()
     ]
 
-
 def container_has_supported_text_or_color_effect(ctn):
     """
-    Permet d'éviter qu'un effet texte supporté soit rejeté uniquement parce
-    qu'il est encodé avec p:iterate type="lt" ou type="wd".
-
-    PowerPoint encode par exemple Underline avec type="lt", même si nous
-    savons l'aplatir en état final.
+    Prevent a supported text effect from being rejected only because it is
+    encoded with p:iterate type="lt" or type="wd".
+    
+    PowerPoint may encode Underline with type="lt", for example, even though it
+    can be flattened to its final state.
     """
     attr_names = attr_names_from_animation_node(ctn)
 
@@ -996,18 +1024,44 @@ def container_has_supported_text_or_color_effect(ctn):
 
     return False
 
+def color_key(color_el):
+    """
+    Normalized key for comparing two colors.
+    
+    The DrawingML color type and its main value are compared.
+    Example:
+      <a:srgbClr val="FF0000"/>    -> ("srgbClr", "FF0000")
+      <a:schemeClr val="accent1"/> -> ("schemeClr", "accent1")
+    
+    The special value "none" represents the absence of a color.
+    """
+    if color_el is None:
+        return ("unknown", None)
+
+    if color_el == "none":
+        return ("none", None)
+
+    q = etree.QName(color_el)
+    return (q.localname, color_el.get("val"))
+
+
+
+# =============================================================================
+# Timeline extraction
+# =============================================================================
+
 def after_animation_events_from_node(animation_node):
     """
-    Extrait les effets post-animation connus depuis un nœud de p:subTnLst.
-
-    Supporté :
-    - Dim after animation via p:animClr, souvent attrName=ppt_c ;
-    - Dim after animation via p:set/p:anim sur couleur texte ;
-    - Hide after animation via style.visibility -> hidden.
+    Extract known post-animation effects from a p:subTnLst node.
+    
+    Supported:
+    - Dim after animation through p:animClr, often with attrName=ppt_c;
+    - Dim after animation through p:set/p:anim on text color;
+    - Hide after animation through style.visibility -> hidden.
     """
     tag = animation_node.tag
 
-    # Cas principal observé : p:animClr / ppt_c / to=...
+    # Main observed case: p:animClr / ppt_c / to=...
     if tag == qn(P, "animClr"):
         color_transition, _ = color_transition_from_anim_clr(animation_node)
 
@@ -1034,7 +1088,7 @@ def after_animation_events_from_node(animation_node):
             for target in targets
         ]
 
-    # Cas génériques p:set / p:anim.
+    # Generic p:set / p:anim cases.
     if tag in {qn(P, "set"), qn(P, "anim")}:
         attr_names = attr_names_from_animation_node(animation_node)
 
@@ -1048,7 +1102,7 @@ def after_animation_events_from_node(animation_node):
         if not targets:
             return []
 
-        # Dim after animation : changement de couleur texte.
+        # Dim after animation: text color change.
         if any(name in {"style.color", "font.color", "ppt_c"} for name in attr_names):
             to_node = animation_node.find("./p:to", namespaces=NS)
             color = color_from_color_container(to_node)
@@ -1088,12 +1142,12 @@ def after_animation_events_from_node(animation_node):
 
 def after_animation_events_from_container(ctn):
     """
-    Retourne les événements post-animation rattachés à un cTn.
-
-    Chaque élément retourné est :
+    Return post-animation events attached to a cTn.
+    
+    Each returned item is:
         (master_relation, [event_template, ...])
-
-    master_relation est typiquement "nextClick" pour Dim after animation.
+    
+    master_relation is typically "nextClick" for Dim after animation.
     """
     result = []
 
@@ -1124,11 +1178,11 @@ def after_animation_events_from_container(ctn):
 
 def is_synthetic_all_at_once_visibility_setup(ctn):
     """
-    Ignore certains nœuds techniques générés par PowerPoint pour les listes.
-
-    Dans le fichier testé, PowerPoint 2019 ajoute des withEffect d'entrée
-    avec grpId="0" qui rendent tous les paragraphes visibles au step 0.
-    Ces nœuds ne correspondent pas aux clics réels de l'utilisateur.
+    Ignore some technical nodes generated by PowerPoint for lists.
+    
+    In the tested file, PowerPoint 2019 adds entrance withEffect nodes with
+    grpId="0" that make all paragraphs visible at step 0. These nodes do not
+    correspond to actual user clicks.
     """
     if ctn.get("nodeType") != "withEffect":
         return False
@@ -1147,8 +1201,8 @@ def is_synthetic_all_at_once_visibility_setup(ctn):
     if set(attr_names) != {"style.visibility"}:
         return False
 
-    # On limite l'exclusion aux nœuds placés dans une séquence onBegin,
-    # ce qui correspond au setup initial observé.
+    # Restrict the exclusion to nodes placed in an onBegin sequence,
+    # which matches the observed initial setup.
     return bool(
         ctn.xpath(
             "ancestor::p:cTn[p:stCondLst/p:cond[@evt='onBegin']]",
@@ -1158,12 +1212,10 @@ def is_synthetic_all_at_once_visibility_setup(ctn):
 
 def all_at_once_build_shape_ids(slide_root):
     """
-    Retourne les IDs de formes dont les paragraphes sont construits
-    all-at-once.
-
-    Dans ce cas, les paragraphes sont visibles dès l'état initial, même si
-    PowerPoint ajoute des nœuds internes style.visibility=visible dans la
-    timeline.
+    Return the IDs of shapes whose paragraphs are built all-at-once.
+    
+    In this case, paragraphs are visible from the initial state, even though
+    PowerPoint adds internal style.visibility=visible nodes to the timeline.
     """
     return {
         bld.get("spid")
@@ -1174,19 +1226,38 @@ def all_at_once_build_shape_ids(slide_root):
         if bld.get("spid")
     }
 
+
 def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
     """
-    Extrait les événements statiques à partir de la timeline.
-
-    Les effets dans p:subTnLst, comme Dim after animation, sont traités
-    comme des événements post-animation. Quand masterRel="nextClick", ils
-    sont appliqués à l'étape du clic suivant.
+    Extract static events from the timeline.
+    
+    Effects in p:subTnLst, such as Dim after animation, are handled as
+    post-animation events. When masterRel="nextClick", they are applied at the
+    next click step.
     """
     events = []
     ignored = 0
     step = 0
     pending_next_click_events = []
     all_at_once_shapes = all_at_once_build_shape_ids(slide_root)
+
+    def count_skip(skip_reason):
+        if report is not None and skip_reason in report:
+            report[skip_reason] += 1
+
+    def targets_from_anim_node(anim_node):
+        targets = []
+
+        for cbhvr in anim_node.xpath(".//p:cBhvr", namespaces=NS):
+            targets.extend(target_from_behavior(cbhvr))
+
+        return dedup_targets(targets)
+
+    def shape_level_target(target):
+        if target[0] == "paragraph":
+            return ("shape", target[1])
+
+        return target
 
     effect_ctns = slide_root.xpath(
         (
@@ -1198,18 +1269,14 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
 
     for ctn in effect_ctns:
         node_type = ctn.get("nodeType")
-        
+
         if is_synthetic_all_at_once_visibility_setup(ctn):
             continue
 
         unsupported_text_kind = unsupported_text_animation_kind(ctn)
 
         if unsupported_text_kind is not None:
-            key = f"unsupported_text_by_{unsupported_text_kind}"
-
-            if report is not None and key in report:
-                report[key] += 1
-
+            count_skip(f"unsupported_text_by_{unsupported_text_kind}")
             ignored += 1
             continue
 
@@ -1239,7 +1306,7 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
 
             return step_for_this_ctn
 
-        # Apparitions / disparitions
+        # Appear / disappear
         if visibility_action is not None:
             targets = []
 
@@ -1251,15 +1318,15 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
 
             targets = dedup_targets(targets)
 
-            # Dans les listes build="allAtOnce", PowerPoint ajoute des
-            # style.visibility=visible par paragraphe, mais ces paragraphes sont
-            # déjà visibles dès l'état initial. Ces shows ne doivent donc pas
-            # déclencher build_initial_visibility().
+            # In build="allAtOnce" lists, PowerPoint adds
+            # style.visibility=visible per paragraph, but these paragraphs are
+            # already visible from the initial state. These show events must
+            # therefore not trigger build_initial_visibility().
             visible_targets = []
 
             for target in targets:
-                # Si un événement de visibilité cible un paragraphe appartenant
-                # à une forme construite all-at-once.
+                # If a visibility event targets a paragraph belonging
+                # to a shape built all-at-once.
                 target_is_all_at_once_paragraph = (
                     target[0] == "paragraph"
                     and target[1] in all_at_once_shapes
@@ -1284,7 +1351,7 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
 
                 has_supported_event = True
 
-        # Transformations normales dans l'ordre XML réel.
+        # Normal transforms in the actual XML order.
         for anim_node in ordered_transform_nodes_from_container(ctn):
             tag = anim_node.tag
 
@@ -1296,16 +1363,10 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 )
 
                 if delta is None:
-                    if report is not None and skip_reason in report:
-                        report[skip_reason] += 1
+                    count_skip(skip_reason)
                     continue
 
-                targets = []
-
-                for cbhvr in anim_node.xpath(".//p:cBhvr", namespaces=NS):
-                    targets.extend(target_from_behavior(cbhvr))
-
-                targets = dedup_targets(targets)
+                targets = targets_from_anim_node(anim_node)
 
                 if not targets:
                     continue
@@ -1314,8 +1375,7 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 dx, dy = delta
 
                 for target in targets:
-                    if target[0] == "paragraph":
-                        target = ("shape", target[1])
+                    target = shape_level_target(target)
 
                     events.append(
                         {
@@ -1334,16 +1394,10 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 scale_factor, skip_reason = scale_factor_from_anim_scale(anim_node)
 
                 if scale_factor is None:
-                    if report is not None and skip_reason in report:
-                        report[skip_reason] += 1
+                    count_skip(skip_reason)
                     continue
 
-                targets = []
-
-                for cbhvr in anim_node.xpath(".//p:cBhvr", namespaces=NS):
-                    targets.extend(target_from_behavior(cbhvr))
-
-                targets = dedup_targets(targets)
+                targets = targets_from_anim_node(anim_node)
 
                 if not targets:
                     continue
@@ -1352,8 +1406,7 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 sx, sy = scale_factor
 
                 for target in targets:
-                    if target[0] == "paragraph":
-                        target = ("shape", target[1])
+                    target = shape_level_target(target)
 
                     events.append(
                         {
@@ -1369,19 +1422,15 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 continue
 
             if tag == qn(P, "animRot"):
-                rotation_transform, skip_reason = rotation_transform_from_anim_rot(anim_node)
+                rotation_transform, skip_reason = rotation_transform_from_anim_rot(
+                    anim_node
+                )
 
                 if rotation_transform is None:
-                    if report is not None and skip_reason in report:
-                        report[skip_reason] += 1
+                    count_skip(skip_reason)
                     continue
 
-                targets = []
-
-                for cbhvr in anim_node.xpath(".//p:cBhvr", namespaces=NS):
-                    targets.extend(target_from_behavior(cbhvr))
-
-                targets = dedup_targets(targets)
+                targets = targets_from_anim_node(anim_node)
 
                 if not targets:
                     continue
@@ -1389,8 +1438,7 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 current_step = ensure_step_for_ctn()
 
                 for target in targets:
-                    if target[0] == "paragraph":
-                        target = ("shape", target[1])
+                    target = shape_level_target(target)
 
                     events.append(
                         {
@@ -1406,19 +1454,15 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 continue
 
             if tag == qn(P, "animClr"):
-                color_transition, skip_reason = color_transition_from_anim_clr(anim_node)
+                color_transition, skip_reason = color_transition_from_anim_clr(
+                    anim_node
+                )
 
                 if color_transition is None:
-                    if report is not None and skip_reason in report:
-                        report[skip_reason] += 1
+                    count_skip(skip_reason)
                     continue
 
-                targets = []
-
-                for cbhvr in anim_node.xpath(".//p:cBhvr", namespaces=NS):
-                    targets.extend(target_from_behavior(cbhvr))
-
-                targets = dedup_targets(targets)
+                targets = targets_from_anim_node(anim_node)
 
                 if not targets:
                     continue
@@ -1444,12 +1488,7 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 alpha, skip_reason = opacity_alpha_from_anim(anim_node)
 
                 if alpha is not None:
-                    targets = []
-
-                    for cbhvr in anim_node.xpath(".//p:cBhvr", namespaces=NS):
-                        targets.extend(target_from_behavior(cbhvr))
-
-                    targets = dedup_targets(targets)
+                    targets = targets_from_anim_node(anim_node)
 
                     if not targets:
                         continue
@@ -1457,8 +1496,7 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                     current_step = ensure_step_for_ctn()
 
                     for target in targets:
-                        if target[0] == "paragraph":
-                            target = ("shape", target[1])
+                        target = shape_level_target(target)
 
                         events.append(
                             {
@@ -1473,23 +1511,16 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                     continue
 
                 if skip_reason is not None:
-                    if report is not None and skip_reason in report:
-                        report[skip_reason] += 1
+                    count_skip(skip_reason)
                     continue
 
                 text_style_change, skip_reason = text_style_change_from_anim(anim_node)
 
                 if text_style_change is None:
-                    if report is not None and skip_reason in report:
-                        report[skip_reason] += 1
+                    count_skip(skip_reason)
                     continue
 
-                targets = []
-
-                for cbhvr in anim_node.xpath(".//p:cBhvr", namespaces=NS):
-                    targets.extend(target_from_behavior(cbhvr))
-
-                targets = dedup_targets(targets)
+                targets = targets_from_anim_node(anim_node)
 
                 if not targets:
                     continue
@@ -1510,13 +1541,13 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                 has_supported_event = True
                 continue
 
-        # Effets post-animation : Dim after animation, etc
+        # Post-animation effects: Dim after animation, etc.
         after_animation_groups = after_animation_events_from_container(ctn)
 
         if after_animation_groups:
-            # Même si l'événement principal est un faux show ignoré à cause de
-            # build="allAtOnce", le conteneur clickEffect représente quand même
-            # un clic utilisateur. Il doit donc appliquer les dims en attente.
+            # Even if the main event is a fake show ignored because of
+            # build="allAtOnce", the clickEffect container still represents
+            # a user click. It must therefore apply pending dim effects.
             if node_type == "clickEffect" and pending_next_click_events:
                 ensure_step_for_ctn()
 
@@ -1543,6 +1574,12 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
             ignored += 1
 
     return events, ignored
+
+
+
+# =============================================================================
+# Visibility and text hiding
+# =============================================================================
 
 def set_transparent_text_fill(rpr):
     fill_tags = {
@@ -1591,7 +1628,6 @@ def set_transparent_text_fill(rpr):
 
     rpr.append(solid)
 
-
 def ensure_run_properties(run_el):
     rpr = run_el.find("./a:rPr", namespaces=NS)
 
@@ -1600,7 +1636,6 @@ def ensure_run_properties(run_el):
         run_el.insert(0, rpr)
 
     return rpr
-
 
 def hide_bullet_for_paragraph(p_el):
     ppr = p_el.find("./a:pPr", namespaces=NS)
@@ -1643,7 +1678,6 @@ def hide_bullet_for_paragraph(p_el):
 
     ppr.append(bu_clr)
 
-
 def hide_paragraph_but_keep_layout(p_el):
     hide_bullet_for_paragraph(p_el)
 
@@ -1656,7 +1690,6 @@ def hide_paragraph_but_keep_layout(p_el):
     end = p_el.find("./a:endParaRPr", namespaces=NS)
     if end is not None:
         set_transparent_text_fill(end)
-
 
 def build_initial_visibility(slide_root, events):
     shapes = all_shape_elements(slide_root)
@@ -1720,11 +1753,17 @@ def apply_visibility_to_slide(
             if not paragraph_visible.get((sid, idx), True):
                 hide_paragraph_but_keep_layout(p)
 
+
+
+# =============================================================================
+# Shape transform and style application
+# =============================================================================
+
 def shape_transform_element(shape):
     """
-    Retourne l'élément de transformation direct d'une forme.
-
-    Cas couverts :
+    Return the direct transform element of a shape.
+    
+    Covered cases:
     - p:sp / p:spPr / a:xfrm
     - p:pic / p:spPr / a:xfrm
     - p:cxnSp / p:spPr / a:xfrm
@@ -1741,7 +1780,6 @@ def shape_transform_element(shape):
             return xfrm
 
     return None
-
 
 def apply_shape_offset(shape, dx, dy):
     xfrm = shape_transform_element(shape)
@@ -1767,10 +1805,11 @@ def apply_shape_offset(shape, dx, dy):
 
 def ensure_transform_parts(shape):
     """
-    Retourne (xfrm, off, ext) pour une forme.
-
-    Crée a:off si absent.
-    Ne crée pas a:ext : sans taille existante, on ne sait pas scaler proprement.
+    Return (xfrm, off, ext) for a shape.
+    
+    Creates a:off if missing.
+    Does not create a:ext: without an existing size, scaling cannot be done
+    safely.
     """
     xfrm = shape_transform_element(shape)
 
@@ -1792,13 +1831,12 @@ def ensure_transform_parts(shape):
 
     return xfrm, off, ext
 
-
 def apply_shape_scale(shape, sx, sy):
     """
-    Applique un Grow/Shrink en conservant le centre de l'objet.
-
-    Les copies statiques repartent toujours du XML original de la slide ;
-    sx/sy doivent donc être des facteurs cumulés depuis l'état initial.
+    Apply a Grow/Shrink effect while preserving the object center.
+    
+    Static copies always start from the original slide XML; sx/sy must therefore
+    be cumulative factors from the initial state.
     """
     _, off, ext = ensure_transform_parts(shape)
 
@@ -1828,15 +1866,15 @@ def apply_shape_scale(shape, sx, sy):
 
 def apply_shape_rotation(shape, rot, rotation_mode="delta"):
     """
-    Applique une rotation à une forme.
-
-    rotation_mode="delta" :
-        ajoute rot à la rotation existante.
-
-    rotation_mode="absolute" :
-        fixe la rotation finale à rot.
-
-    La rotation DrawingML se fait autour du centre de la boîte englobante.
+    Apply a rotation to a shape.
+    
+    rotation_mode="delta":
+        add rot to the existing rotation.
+    
+    rotation_mode="absolute":
+        set the final rotation to rot.
+    
+    DrawingML rotation is performed around the center of the bounding box.
     """
     xfrm = shape_transform_element(shape)
 
@@ -1863,7 +1901,7 @@ def apply_shape_rotation(shape, rot, rotation_mode="delta"):
 
 def set_alpha_on_color(color_el, alpha):
     """
-    Force l'opacité d'une couleur DrawingML.
+    Force the opacity of a DrawingML color.
     """
     for child in list(color_el):
         if child.tag in {
@@ -1877,7 +1915,6 @@ def set_alpha_on_color(color_el, alpha):
     alpha_el.set("val", str(clamp_alpha(alpha)))
     color_el.append(alpha_el)
 
-
 def apply_alpha_to_solid_fill(solid_fill, alpha):
     for child in solid_fill:
         if child.tag in COLOR_TAGS:
@@ -1888,10 +1925,10 @@ def apply_alpha_to_solid_fill(solid_fill, alpha):
 
 def apply_alpha_to_style_refs(shape, alpha):
     """
-    Applique l'opacité aux couleurs héritées via p:style.
-
-    Couvre notamment les formes dont le remplissage ou le contour vient
-    d'un fillRef / lnRef au lieu d'un a:solidFill explicite.
+    Apply opacity to colors inherited through p:style.
+    
+    This covers shapes whose fill or line comes from a fillRef / lnRef instead
+    of an explicit a:solidFill.
     """
     applied = False
 
@@ -1909,9 +1946,9 @@ def apply_alpha_to_style_refs(shape, alpha):
 
 def apply_alpha_to_blip(shape, alpha):
     """
-    Applique l'opacité aux images via a:alphaModFix.
-
-    Couvre les p:pic et les remplissages image simples.
+    Apply opacity to images through a:alphaModFix.
+    
+    This covers p:pic elements and simple image fills.
     """
     applied = False
 
@@ -1930,16 +1967,16 @@ def apply_alpha_to_blip(shape, alpha):
 
 def apply_shape_opacity(shape, alpha):
     """
-    Applique une opacité finale à une forme.
-
-    On cible les cas statiques les plus utiles :
-    - remplissage de forme explicite ;
-    - contour explicite ;
-    - texte avec couleur explicite ;
-    - images via a:blip ;
-    - couleurs héritées via p:style / fillRef / lnRef / fontRef.
-
-    Pour les groupes, les recherches .// parcourent aussi les formes enfants.
+    Apply a final opacity value to a shape.
+    
+    The most useful static cases are targeted:
+    - explicit shape fill;
+    - explicit line;
+    - text with explicit color;
+    - images through a:blip;
+    - colors inherited through p:style / fillRef / lnRef / fontRef.
+    
+    For groups, .// searches also visit child shapes.
     """
     alpha = clamp_alpha(alpha)
     applied = False
@@ -1999,7 +2036,6 @@ def apply_text_style_to_paragraph(p_el, text_style, value):
 
     return applied
 
-
 def apply_shape_text_style(shape, text_style, value, paragraph_index=None):
     paragraphs = paragraphs_of_shape(shape)
 
@@ -2021,26 +2057,6 @@ def apply_shape_text_style(shape, text_style, value, paragraph_index=None):
 
     return applied
 
-def color_key(color_el):
-    """
-    Clé normalisée pour comparer deux couleurs.
-
-    On compare le type de couleur DrawingML et sa valeur principale.
-    Exemple :
-      <a:srgbClr val="FF0000"/>    -> ("srgbClr", "FF0000")
-      <a:schemeClr val="accent1"/> -> ("schemeClr", "accent1")
-
-    La valeur spéciale "none" représente l'absence de couleur.
-    """
-    if color_el is None:
-        return ("unknown", None)
-
-    if color_el == "none":
-        return ("none", None)
-
-    q = etree.QName(color_el)
-    return (q.localname, color_el.get("val"))
-
 def replace_fill_child(parent, color_el, insert_before_tags=None):
     if insert_before_tags is None:
         insert_before_tags = set()
@@ -2061,7 +2077,6 @@ def replace_fill_child(parent, color_el, insert_before_tags=None):
     parent.append(solid_fill)
     return True
 
-
 def apply_fill_color_to_shape(shape, color_el):
     applied = False
 
@@ -2081,7 +2096,6 @@ def apply_fill_color_to_shape(shape, color_el):
             applied = True
 
     return applied
-
 
 def ensure_line_properties(sp_pr):
     ln = sp_pr.find("./a:ln", namespaces=NS)
@@ -2181,7 +2195,6 @@ def apply_text_color_to_paragraph(p_el, color_el):
 
     return applied
 
-
 def apply_text_color_to_shape(shape, color_el, paragraph_index=None):
     paragraphs = paragraphs_of_shape(shape)
 
@@ -2202,7 +2215,6 @@ def apply_text_color_to_shape(shape, color_el, paragraph_index=None):
 
     return applied
 
-
 def apply_shape_color(shape, color_kind, color_el, paragraph_index=None):
     if color_el is None:
         return False
@@ -2222,6 +2234,12 @@ def apply_shape_color(shape, color_kind, color_el, paragraph_index=None):
 
     return False
 
+
+
+# =============================================================================
+# Initial style state
+# =============================================================================
+
 def direct_color_key_from_path(shape, path):
     colors = shape.xpath(path, namespaces=NS)
 
@@ -2229,7 +2247,6 @@ def direct_color_key_from_path(shape, path):
         return ("unknown", None)
 
     return color_key(colors[0])
-
 
 def current_fill_color_key(shape):
     if shape.xpath("./p:spPr/a:noFill | ./p:grpSpPr/a:noFill", namespaces=NS):
@@ -2250,9 +2267,9 @@ def current_fill_color_key(shape):
 
     return key
 
-
 def current_line_color_key(shape):
-    if shape.xpath("./p:spPr/a:ln/a:noFill | ./p:grpSpPr/a:ln/a:noFill", namespaces=NS):
+    if shape.xpath("./p:spPr/a:ln/a:noFill | ./p:grpSpPr/a:ln/a:noFill",
+                   namespaces=NS):
         return ("none", None)
 
     key = direct_color_key_from_path(
@@ -2269,7 +2286,6 @@ def current_line_color_key(shape):
     )
 
     return key
-
 
 def current_text_color_key(shape):
     key = direct_color_key_from_path(
@@ -2307,7 +2323,6 @@ def text_style_value_from_rpr(rpr, text_style):
 
     return "unknown"
 
-
 def paragraph_text_style_state(p_el, text_style):
     runs = p_el.xpath(".//a:r | .//a:fld", namespaces=NS)
 
@@ -2327,7 +2342,6 @@ def paragraph_text_style_state(p_el, text_style):
 
     return "unknown"
 
-
 def shape_text_style_state(shape, text_style):
     paragraphs = paragraphs_of_shape(shape)
 
@@ -2345,7 +2359,6 @@ def shape_text_style_state(shape, text_style):
         return first
 
     return "unknown"
-
 
 def build_text_style_state_for_shape(shape):
     paragraphs = paragraphs_of_shape(shape)
@@ -2368,14 +2381,13 @@ def build_text_style_state_for_shape(shape):
         "paragraphs": paragraph_states,
     }
 
-
 def build_initial_style_state(slide_root):
     """
-    État courant des couleurs et des styles texte par forme.
-
-    Les couleurs servent aux animations Fill/Line/Font Color.
-    Les styles texte servent à éviter des slides redondantes pour
-    Bold / Italic / Underline / Strikethrough.
+    Current color and text-style state by shape.
+    
+    Colors are used for Fill/Line/Font Color animations.
+    Text styles are used to avoid redundant slides for Bold / Italic /
+    Underline / Strikethrough.
     """
     state = {}
     shapes = all_shape_elements(slide_root)
@@ -2476,13 +2488,13 @@ def color_state_key_for_target(shape_style_state, target, color_kind):
             shape_style_state
             .get(sid, {})
             .get("paragraph_text_colors", {})
-            .get(pidx, shape_style_state.get(sid, {}).get("text", ("unknown", None)))
+            .get(pidx, shape_style_state.get(sid, {})
+                                        .get("text", ("unknown", None)))
         )
 
     _, sid = target[:2]
 
     return shape_style_state.get(sid, {}).get(color_kind, ("unknown", None))
-
 
 def set_color_state_key_for_target(shape_style_state, target, color_kind, key):
     if target[0] == "paragraph" and color_kind == "text":
@@ -2507,22 +2519,27 @@ def set_color_state_key_for_target(shape_style_state, target, color_kind, key):
     _, sid = target[:2]
     shape_style_state.setdefault(sid, {})[color_kind] = key
 
+
+
+# =============================================================================
+# Timeline application
+# =============================================================================
+
 def append_shape_transform(shape_transforms, sid, transform):
     """
-    Ajoute une transformation à la liste ordonnée d'une forme.
-
-    On conserve l'ordre chronologique des effets PowerPoint.
-    Les actions actuellement utilisées sont move, scale, rotate et opacity.
+    Append a transform to the ordered list for a shape.
+    
+    The chronological order of PowerPoint effects is preserved. The actions
+    currently used are move, scale, rotate, and opacity.
     """
     shape_transforms.setdefault(sid, []).append(transform)
 
-
 def apply_shape_transform(shape, transform):
     """
-    Applique une transformation élémentaire à une forme.
-
-    Cette fonction centralise l'application des transformations et permet
-    d'ajouter de nouveaux effets sans modifier la boucle principale.
+    Apply one elementary transform to a shape.
+    
+    This function centralizes transform application and makes it possible to
+    add new effects without changing the main loop.
     """
     action = transform["action"]
 
@@ -2573,11 +2590,11 @@ def apply_shape_transform(shape, transform):
 
 def apply_transforms_to_slide(slide_root, shape_transforms):
     """
-    Applique les transformations géométriques cumulées à une copie de slide.
-
-    Contrairement à l'ancien modèle shape_offsets / shape_scales, on garde
-    ici l'ordre des transformations. Cela ne change pas le comportement actuel
-    pour move + scale centré, mais prépare les transformations non commutatives.
+    Apply cumulative geometric transforms to a slide copy.
+    
+    Unlike the older shape_offsets / shape_scales model, the transform order is
+    kept here. This does not change the current behavior for move + centered
+    scale, but it prepares for non-commutative transforms.
     """
     if not shape_transforms:
         return
@@ -2589,7 +2606,7 @@ def apply_transforms_to_slide(slide_root, shape_transforms):
 
         if shape is None:
             continue
-        #Applique les transformations d'une forme dans l'ordre de la timeline
+        # Apply a shape's transforms in timeline order.
         for transform in transforms:
             apply_shape_transform(shape, transform)
 
@@ -2605,37 +2622,55 @@ def color_transition_needs_from_slide(event, shape_style_state):
     current_key = style_state_key(shape_style_state, sid, color_kind)
     from_key = color_key(from_color)
 
-    # Si l'état courant est inconnu, on est conservateur :
-    # on garde l'état from pour ne pas rater une étape visible.
+    # If the current state is unknown, be conservative:
+    # keep the from state to avoid missing a visible step.
     if current_key[0] == "unknown":
         return True
 
     return current_key != from_key
 
-
-def event_changes_visible_state(
+def event_visible_change_status(
     event,
     shape_visible,
     paragraph_visible,
     shape_style_state=None,
     color_post_mode=False,
 ):
-    """
-    Indique si un événement justifie d'émettre une nouvelle slide.
-
-    Un move / scale / rotate / opacity appliqué à un objet invisible est
-    mémorisé, mais ne produit pas de slide visible immédiatement.
-    """
     action = event["action"]
     target = event["target"]
+
+    def target_visibility_reason(target):
+        if target[0] == "shape":
+            _, sid = target
+
+            if not shape_visible.get(sid, True):
+                return False, "the shape was hidden before this step"
+
+            return True, None
+
+        if target[0] == "paragraph":
+            _, sid, pidx = target
+
+            if not shape_visible.get(sid, True):
+                return False, "the parent shape was hidden before this step"
+
+            if not paragraph_visible.get((sid, pidx), True):
+                return False, "the paragraph was hidden before this step"
+
+            return True, None
+
+        return False, "the target could not be identified"
 
     if action == "move":
         _, sid = target
 
         if event.get("dx", 0) == 0 and event.get("dy", 0) == 0:
-            return False
+            return False, "the Motion Path ends at the same position"
 
-        return shape_visible.get(sid, True)
+        if not shape_visible.get(sid, True):
+            return False, "the shape was hidden before this step"
+
+        return True, None
 
     if action == "scale":
         _, sid = target
@@ -2644,9 +2679,12 @@ def event_changes_visible_state(
         sy = event.get("sy", 1.0)
 
         if abs(sx - 1.0) < 1e-9 and abs(sy - 1.0) < 1e-9:
-            return False
+            return False, "the Grow/Shrink effect keeps the same final size"
 
-        return shape_visible.get(sid, True)
+        if not shape_visible.get(sid, True):
+            return False, "the shape was hidden before this step"
+
+        return True, None
 
     if action == "rotate":
         _, sid = target
@@ -2654,185 +2692,140 @@ def event_changes_visible_state(
         rot = event.get("rot", 0)
 
         if normalize_rotation(rot) == 0 and event.get("rotation_mode", "delta") == "delta":
-            return False
+            return False, "the Spin effect keeps the same final angle"
 
-        return shape_visible.get(sid, True)
+        if not shape_visible.get(sid, True):
+            return False, "the shape was hidden before this step"
+
+        return True, None
 
     if action == "opacity":
         _, sid = target
 
-        alpha = event.get("alpha")
+        if event.get("alpha") is None:
+            return False, "the Transparency value could not be read"
 
-        if alpha is None:
-            return False
+        if not shape_visible.get(sid, True):
+            return False, "the shape was hidden before this step"
 
-        return shape_visible.get(sid, True)
+        return True, None
 
     if action == "color":
-        color_kind = event["color_kind"]
+        visible, reason = target_visibility_reason(target)
 
-        if target[0] == "shape":
-            _, sid = target
-
-            if not shape_visible.get(sid, True):
-                return False
-
-        elif target[0] == "paragraph":
-            _, sid, pidx = target
-
-            if not shape_visible.get(sid, True):
-                return False
-
-            if not paragraph_visible.get((sid, pidx), True):
-                return False
+        if not visible:
+            return False, reason
 
         if shape_style_state is None:
-            return True
+            return True, None
 
         current_key = color_state_key_for_target(
             shape_style_state,
             target,
-            color_kind,
+            event["color_kind"],
         )
 
         new_key = color_key(event["color"])
 
-        return current_key != new_key
+        if current_key == new_key:
+            return False, "the color was already applied"
+
+        return True, None
 
     if action == "color_transition":
-        _, sid = target
+        visible, reason = target_visibility_reason(target)
+
+        if not visible:
+            return False, reason
 
         if shape_style_state is None:
-            return shape_visible.get(sid, True)
+            return True, None
 
         if color_post_mode:
+            if color_transition_needs_from_slide(event, shape_style_state):
+                return True, None
+
             return (
-                shape_visible.get(sid, True)
-                and color_transition_needs_from_slide(event, shape_style_state)
+                False,
+                "the initial color of the transition already matches the current color",
             )
 
-        current_key = style_state_key(
+        current_key = color_state_key_for_target(
             shape_style_state,
-            sid,
+            target,
             event["color_kind"],
         )
 
         to_key = color_key(event["to_color"])
 
-        return shape_visible.get(sid, True) and current_key != to_key
+        if current_key == to_key:
+            return False, "the final color was already applied"
+
+        return True, None
 
     if action == "text_style":
-        text_style = event["text_style"]
-        new_value = event["value"]
+        visible, reason = target_visibility_reason(target)
+
+        if not visible:
+            return False, reason
 
         if shape_style_state is None:
-            if target[0] == "shape":
-                _, sid = target
-                return shape_visible.get(sid, True)
-
-            if target[0] == "paragraph":
-                _, sid, pidx = target
-                return (
-                    shape_visible.get(sid, True)
-                    and paragraph_visible.get((sid, pidx), True)
-                )
-
-        if target[0] == "shape":
-            _, sid = target
-
-            if not shape_visible.get(sid, True):
-                return False
-
-        elif target[0] == "paragraph":
-            _, sid, pidx = target
-
-            if not shape_visible.get(sid, True):
-                return False
-
-            if not paragraph_visible.get((sid, pidx), True):
-                return False
+            return True, None
 
         current_value = text_style_state_value(
             shape_style_state,
             target,
-            text_style,
+            event["text_style"],
         )
 
         if current_value == "unknown":
-            return True
+            return True, None
 
-        return current_value != new_value
+        new_value = event["value"]
+
+        if current_value == new_value:
+            labels = {
+                "bold": "Bold",
+                "italic": "Italic",
+                "underline": "Underline",
+                "strike": "Strikethrough",
+            }
+
+            label = labels.get(event["text_style"], "the text style")
+            state = "on" if new_value else "off"
+
+            return False, f"{label} was already {state}"
+
+        return True, None
 
     if action in {"show", "hide"}:
         value = action == "show"
 
         if target[0] == "shape":
             _, sid = target
-            return shape_visible.get(sid, True) != value
+            current_value = shape_visible.get(sid, True)
+
+            if current_value == value:
+                state = "visible" if value else "hidden"
+                return False, f"the shape was already {state}"
+
+            return True, None
 
         if target[0] == "paragraph":
             _, sid, pidx = target
 
             if not shape_visible.get(sid, True):
-                return False
+                return False, "the parent shape was hidden before this step"
 
-            return paragraph_visible.get((sid, pidx), True) != value
+            current_value = paragraph_visible.get((sid, pidx), True)
 
-    return False
+            if current_value == value:
+                state = "visible" if value else "hidden"
+                return False, f"the paragraph was already {state}"
 
-def clean_slide_rels(rels_data):
-    if rels_data is None:
-        root = etree.Element(qn(REL, "Relationships"))
-        return xml_bytes(root)
+            return True, None
 
-    root = parse_xml(rels_data)
-
-    for rel in list(root):
-        rel_type = rel.get("Type", "")
-
-        if rel_type.endswith(("/notesSlide", "/comments", "/commentAuthors")):
-            root.remove(rel)
-
-    return xml_bytes(root)
-
-
-def next_free_rid(used):
-    i = 1
-
-    while True:
-        rid = f"rId{i}"
-
-        if rid not in used:
-            used.add(rid)
-            return rid
-
-        i += 1
-
-def presentation_slide_size(pres_root):
-    sld_sz = pres_root.find("./p:sldSz", namespaces=NS)
-
-    if sld_sz is None:
-        # Taille widescreen PowerPoint par défaut : 13.333 x 7.5 pouces.
-        return 12192000, 6858000
-
-    return int(sld_sz.get("cx")), int(sld_sz.get("cy"))
-
-def new_conversion_report():
-    return {
-        "closed_or_zero_motion_paths": 0,
-        "unsupported_motion_paths": 0,
-        "skipped_redundant_events": 0,
-        "unsupported_text_by_word": 0,
-        "unsupported_text_by_letter": 0,
-        "unsupported_text_by_character": 0,
-        "unsupported_scale_animations": 0,
-        "neutral_scale_animations": 0,
-        "unsupported_rotation_animations": 0,
-        "neutral_rotation_animations": 0,
-        "unsupported_opacity_animations": 0,
-        "unsupported_color_animations": 0,
-        "unsupported_text_style_animations": 0,
-    }
+    return False, "the effect did not change the visible slide"
 
 def append_color_transform(
     shape_transforms,
@@ -2863,11 +2856,11 @@ def apply_timeline_event(
     color_post_mode=False,
 ):
     """
-    Applique un événement à l'état courant de la slide.
-
-    post_step_events est utilisé pour les effets de couleur from -> to :
-    l'état from est appliqué dans l'étape courante si nécessaire, puis
-    l'état to est appliqué dans une étape post-animation commune.
+    Apply one event to the current slide state.
+    
+    post_step_events is used for from -> to color effects: the from state is
+    applied in the current step if needed, then the to state is applied in a
+    shared post-animation step.
     """
     action = event["action"]
     target = event["target"]
@@ -2887,7 +2880,7 @@ def apply_timeline_event(
                 shape_visible[sid] = True
 
         return
-        
+
     simple_transform_fields = {
         "move": [
             ("dx", "dx", None),
@@ -2955,10 +2948,20 @@ def apply_timeline_event(
         return
 
     if action == "color_transition":
-        _, sid = target
         color_kind = event["color_kind"]
         from_color = event.get("from_color")
         to_color = event["to_color"]
+
+        if target[0] == "shape":
+            _, sid = target
+            paragraph_index = None
+
+        elif target[0] == "paragraph":
+            _, sid, pidx = target
+            paragraph_index = pidx if color_kind == "text" else None
+
+        else:
+            return
 
         if color_post_mode:
             if from_color is not None and color_transition_needs_from_slide(
@@ -2970,11 +2973,12 @@ def apply_timeline_event(
                     sid,
                     color_kind,
                     from_color,
+                    paragraph_index,
                 )
 
-                set_style_state_key(
+                set_color_state_key_for_target(
                     shape_style_state,
-                    sid,
+                    target,
                     color_kind,
                     color_key(from_color),
                 )
@@ -2996,14 +3000,17 @@ def apply_timeline_event(
             sid,
             color_kind,
             to_color,
+            paragraph_index,
         )
 
-        set_style_state_key(
+        set_color_state_key_for_target(
             shape_style_state,
-            sid,
+            target,
             color_kind,
             color_key(to_color),
         )
+
+        return
 
     if action == "text_style":
         text_style = event["text_style"]
@@ -3041,8 +3048,8 @@ def apply_timeline_event(
 
 def step_requires_color_post_state(step_events, shape_style_state):
     """
-    Une étape a besoin d'un état post-animation si au moins une transition
-    de couleur possède un from différent de l'état courant.
+    A step requires a post-animation state if at least one color transition has
+    a from color different from the current color.
     """
     for event in step_events:
         if event["action"] != "color_transition":
@@ -3053,7 +3060,6 @@ def step_requires_color_post_state(step_events, shape_style_state):
 
     return False
 
-
 def apply_timeline_events(
     step_events,
     shape_visible,
@@ -3061,13 +3067,14 @@ def apply_timeline_events(
     shape_transforms,
     shape_style_state,
     force_emit=False,
+    skipped_event_details=None,
 ):
     """
-    Applique les événements d'une étape dans leur ordre.
-
-    Retourne :
-      - emit_slide : faut-il émettre une slide après application ?
-      - post_step_events : événements à appliquer après l'émission courante
+    Apply the events of one step in order.
+    
+    Returns:
+      - emit_slide: whether a slide should be emitted after application;
+      - post_step_events: events to apply after the current emission.
     """
     emit_slide = force_emit
     post_step_events = []
@@ -3078,14 +3085,24 @@ def apply_timeline_events(
     )
 
     for event in step_events:
-        if event_changes_visible_state(
+        changes_visible_state, skip_reason = event_visible_change_status(
             event,
             shape_visible,
             paragraph_visible,
             shape_style_state,
             color_post_mode,
-        ):
+        )
+
+        if changes_visible_state:
             emit_slide = True
+
+        elif skipped_event_details is not None:
+            skipped_event_details.append(
+                {
+                    "event": event,
+                    "reason": skip_reason,
+                }
+            )
 
         apply_timeline_event(
             event,
@@ -3098,6 +3115,263 @@ def apply_timeline_events(
         )
 
     return emit_slide, post_step_events
+
+
+
+# =============================================================================
+# Conversion report
+# =============================================================================
+
+
+def init_conversion_report():
+    return {
+        "closed_or_zero_motion_paths": 0,
+        "unsupported_motion_paths": 0,
+        "skipped_redundant_events": 0,
+        "skipped_redundant_steps": [],
+        "unsupported_text_by_word": 0,
+        "unsupported_text_by_letter": 0,
+        "unsupported_text_by_character": 0,
+        "unsupported_scale_animations": 0,
+        "neutral_scale_animations": 0,
+        "unsupported_rotation_animations": 0,
+        "neutral_rotation_animations": 0,
+        "unsupported_opacity_animations": 0,
+        "unsupported_color_animations": 0,
+        "unsupported_text_style_animations": 0,
+    }
+
+def describe_target(target):
+    if target[0] == "shape":
+        return f"shape id {target[1]}"
+
+    if target[0] == "paragraph":
+        _, sid, pidx = target
+        return f"paragraph {pidx} of shape id {sid}"
+
+    return str(target)
+
+def describe_timeline_event(event):
+    action = event.get("action", "?")
+    target = describe_target(event.get("target"))
+
+    if action == "move":
+        return f"Motion Path on {target}"
+
+    if action == "scale":
+        return f"Grow/Shrink on {target}"
+
+    if action == "rotate":
+        return f"Spin on {target}"
+
+    if action == "opacity":
+        return f"Transparency on {target}"
+
+    if action == "color":
+        color_kind = event.get("color_kind")
+
+        labels = {
+            "fill": "Fill Color",
+            "line": "Line Color",
+            "text": "Font Color",
+        }
+
+        return f"{labels.get(color_kind, 'Color')} on {target}"
+
+    if action == "color_transition":
+        color_kind = event.get("color_kind")
+
+        labels = {
+            "fill": "Fill Color",
+            "line": "Line Color",
+            "text": "Font Color",
+        }
+
+        return f"{labels.get(color_kind, 'Color')} transition on {target}"
+
+    if action == "text_style":
+        labels = {
+            "bold": "Bold",
+            "italic": "Italic",
+            "underline": "Underline",
+            "strike": "Strikethrough",
+        }
+
+        text_style = event.get("text_style")
+        return f"{labels.get(text_style, 'Text style')} on {target}"
+
+    if action == "show":
+        return f"Appear/Show on {target}"
+
+    if action == "hide":
+        return f"Disappear/Hide on {target}"
+
+    return f"{action} on {target}"
+
+def record_skipped_step(
+    report,
+    original_slide_number,
+    original_slide_path,
+    step_label,
+    skipped_event_details,
+    keep_details=False,
+):
+    report["skipped_redundant_events"] += len(skipped_event_details)
+
+    if not keep_details:
+        return
+
+    report["skipped_redundant_steps"].append(
+        {
+            "slide_number": original_slide_number,
+            "slide_path": original_slide_path,
+            "step": step_label,
+            "events": [
+                {
+                    "description": describe_timeline_event(item["event"]),
+                    "reason": item.get("reason"),
+                }
+                for item in skipped_event_details
+            ],
+        }
+    )
+
+def print_conversion_report(
+    report,
+    output_path,
+    total_original,
+    total_generated,
+    total_events,
+    total_ignored,
+    report_level="summary",
+):
+    if report_level == "none":
+        return
+
+    print("Done.")
+    print(f"Original slides         : {total_original}")
+    print(f"Generated slides        : {total_generated}")
+    print(f"Supported events        : {total_events}")
+    print(f"Ignored events          : {total_ignored}")
+
+    report_messages = [
+        (
+            "closed_or_zero_motion_paths",
+            "Motion Path effects with no different final position",
+            (
+                "(for example a path that returns to its starting point; "
+                "no additional static slide is needed)"
+            ),
+        ),
+        (
+            "unsupported_motion_paths",
+            "Motion Path effects not converted",
+            (
+                "(the movement used by PowerPoint could not be read reliably)"
+            ),
+        ),
+    ]
+
+    for key, label, explanation in report_messages:
+        if report[key]:
+            print(f"{label}: {report[key]} {explanation}")
+
+    if report["skipped_redundant_events"]:
+        print(
+            "Events with no visible change: "
+            f"{report['skipped_redundant_events']} "
+            "(steps not exported as separate slides)"
+        )
+
+        if report_level == "detail":
+            for skipped in report["skipped_redundant_steps"]:
+                print(
+                    "  - original slide "
+                    f"{skipped['slide_number']} "
+                    f"({skipped['slide_path']}), "
+                    f"step {skipped['step']}: "
+                    f"{len(skipped['events'])} event(s)"
+                )
+
+                for event_info in skipped["events"]:
+                    reason = event_info.get("reason")
+
+                    if reason:
+                        print(f"      - {event_info['description']}: {reason}.")
+                    else:
+                        print(f"      - {event_info['description']}.")
+
+    unsupported_text_total = (
+        report["unsupported_text_by_word"]
+        + report["unsupported_text_by_letter"]
+        + report["unsupported_text_by_character"]
+    )
+
+    if unsupported_text_total:
+        print(
+            "Text animations split by word, letter, or character not converted: "
+            f"{unsupported_text_total} "
+            "(PowerPoint text effects using Effect Options > Animate text)"
+        )
+
+        if report["unsupported_text_by_word"]:
+            print(f"  - by word           : {report['unsupported_text_by_word']}")
+
+        if report["unsupported_text_by_letter"]:
+            print(f"  - by letter         : {report['unsupported_text_by_letter']}")
+
+        if report["unsupported_text_by_character"]:
+            print(f"  - character range   : {report['unsupported_text_by_character']}")
+
+    animation_report_messages = [
+        (
+            "unsupported_scale_animations",
+            "Grow/Shrink effects not converted",
+            "(the final size could not be read reliably)",
+        ),
+        (
+            "neutral_scale_animations",
+            "Grow/Shrink effects with no final size change",
+            "(ignored because they do not create a different static state)",
+        ),
+        (
+            "unsupported_rotation_animations",
+            "Spin effects not converted",
+            "(the final rotation angle could not be read reliably)",
+        ),
+        (
+            "neutral_rotation_animations",
+            "Spin effects with no final angle change",
+            "(ignored because they do not create a different static state)",
+        ),
+        (
+            "unsupported_opacity_animations",
+            "Transparency effects not converted",
+            "(the final transparency value could not be read reliably)",
+        ),
+        (
+            "unsupported_color_animations",
+            "Color emphasis effects not converted",
+            "(Fill Color, Line Color, or Font Color effects whose target or final color could not be read)",
+        ),
+        (
+            "unsupported_text_style_animations",
+            "Text style emphasis effects not converted",
+            "(Bold, Italic, Underline, or Strikethrough effects whose final state could not be read)",
+        ),
+    ]
+
+    for key, label, explanation in animation_report_messages:
+        if report[key]:
+            print(f"{label}: {report[key]} {explanation}")
+
+    print(f"Output                  : {output_path}")
+
+
+
+# =============================================================================
+# PPTX package rewriting
+# =============================================================================
 
 def write_static_slide(
     slide_root,
@@ -3115,7 +3389,7 @@ def write_static_slide(
     shape_transforms,
 ):
     """
-    Écrit une copie statique de la slide courante dans le package PPTX.
+    Write a static copy of the current slide into the PPTX package.
     """
     new_slide_root = copy.deepcopy(slide_root)
 
@@ -3156,7 +3430,14 @@ def write_static_slide(
 
     return new_slide_index + 1, new_slide_id + 1
 
-def split_pptx_static(input_path, output_path):
+
+def split_pptx_static(
+    input_path,
+    output_path,
+    report_level="summary",
+    report_output_path=None,
+    print_report=True,
+):
     input_path = Path(input_path)
     output_path = Path(output_path)
 
@@ -3175,7 +3456,10 @@ def split_pptx_static(input_path, output_path):
 
     for name in required:
         if name not in entries:
-            raise ValueError(f"Fichier PPTX incomplet : {name} absent")
+            raise ValueError(
+                "Input file is not a valid PPTX presentation package: "
+                f"missing {name}"
+            )
 
     pres_root = parse_xml(entries["ppt/presentation.xml"])
     pres_rels_root = parse_xml(entries["ppt/_rels/presentation.xml.rels"])
@@ -3189,25 +3473,61 @@ def split_pptx_static(input_path, output_path):
 
     sld_id_lst = pres_root.find(".//p:sldIdLst", namespaces=NS)
     if sld_id_lst is None:
-        raise ValueError("Aucune liste de slides p:sldIdLst trouvée")
+        raise ValueError(
+            "Invalid PPTX package: missing slide list in ppt/presentation.xml."
+        )
 
     original_slide_paths = []
 
-    for sld_id in sld_id_lst.findall("./p:sldId", namespaces=NS):
+    for original_slide_number, sld_id in enumerate(
+        sld_id_lst.findall("./p:sldId", namespaces=NS),
+        start=1,
+    ):
         rid = sld_id.get(qn(R, "id"))
+
+        if not rid:
+            raise ValueError(
+                "Invalid PPTX package: "
+                f"slide {original_slide_number} has no relationship id."
+            )
+
         rel = rel_by_id.get(rid)
 
-        if rel is None or rel.get("Type") != SLIDE_REL_TYPE:
-            continue
+        if rel is None:
+            raise ValueError(
+                "Invalid PPTX package: "
+                f"slide {original_slide_number} references missing relationship {rid!r}."
+            )
+
+        rel_type = rel.get("Type")
+
+        if rel_type != SLIDE_REL_TYPE:
+            raise ValueError(
+                "Invalid PPTX package: "
+                f"slide {original_slide_number} relationship {rid!r} "
+                f"has unexpected type {rel_type!r}."
+            )
 
         target = rel.get("Target")
+
+        if not target:
+            raise ValueError(
+                "Invalid PPTX package: "
+                f"slide {original_slide_number} relationship {rid!r} has no target."
+            )
+
         slide_path = rel_target_to_part("ppt/presentation.xml", target)
 
-        if slide_path in entries:
-            original_slide_paths.append(slide_path)
+        if slide_path not in entries:
+            raise ValueError(
+                "Invalid PPTX package: "
+                f"slide {original_slide_number} points to missing part {slide_path!r}."
+            )
+
+        original_slide_paths.append(slide_path)
 
     if not original_slide_paths:
-        raise ValueError("Aucune slide trouvée dans la présentation")
+        raise ValueError("No slides found in the input presentation.")
 
     new_entries = {
         name: data
@@ -3244,14 +3564,20 @@ def split_pptx_static(input_path, output_path):
     total_generated = 0
     total_events = 0
     total_ignored = 0
-    
-    report = new_conversion_report()
 
-    for original_slide_path in original_slide_paths:
+    report = init_conversion_report()
+    keep_report_details = report_level == "detail"
+
+    for original_slide_number, original_slide_path in enumerate(
+        original_slide_paths,
+        start=1,
+    ):
         total_original += 1
 
         slide_root = parse_xml(entries[original_slide_path])
-        original_rels_path = f"ppt/slides/_rels/{posixpath.basename(original_slide_path)}.rels"
+        original_rels_path = (
+            f"ppt/slides/_rels/{posixpath.basename(original_slide_path)}.rels"
+        )
         original_rels_data = entries.get(original_rels_path)
 
         events, ignored = extract_timeline_events(
@@ -3278,14 +3604,15 @@ def split_pptx_static(input_path, output_path):
 
         max_step = max(events_by_step.keys(), default=0)
 
-        # Transformations cumulées pour la slide originale courante.
-        # On les réinitialise à chaque nouvelle slide originale,
-        # mais on les conserve entre les étapes générées de cette slide.
+        # Cumulative transforms for the current original slide.
+        # Reset them for each new original slide,
+        # but keep them across the generated steps of that slide.
         shape_transforms = {}
 
         for step in range(0, max_step + 1):
             step_events = events_by_step.get(step, [])
 
+            skipped_event_details = []
             emit_slide, post_step_events = apply_timeline_events(
                 step_events,
                 shape_visible,
@@ -3293,11 +3620,19 @@ def split_pptx_static(input_path, output_path):
                 shape_transforms,
                 shape_style_state,
                 force_emit=(step == 0),
+                skipped_event_details=skipped_event_details,
             )
 
             if not emit_slide:
                 if step_events:
-                    report["skipped_redundant_events"] += len(step_events)
+                    record_skipped_step(
+                        report,
+                        original_slide_number,
+                        original_slide_path,
+                        step,
+                        skipped_event_details,
+                        keep_details=keep_report_details,
+                    )
                 continue
 
             new_slide_index, new_slide_id = write_static_slide(
@@ -3319,6 +3654,8 @@ def split_pptx_static(input_path, output_path):
             total_generated += 1
 
             while post_step_events:
+                skipped_post_event_details = []
+
                 emit_post_slide, next_post_step_events = apply_timeline_events(
                     post_step_events,
                     shape_visible,
@@ -3326,6 +3663,7 @@ def split_pptx_static(input_path, output_path):
                     shape_transforms,
                     shape_style_state,
                     force_emit=False,
+                    skipped_event_details=skipped_post_event_details,
                 )
 
                 if emit_post_slide:
@@ -3348,7 +3686,14 @@ def split_pptx_static(input_path, output_path):
                     total_generated += 1
 
                 elif post_step_events:
-                    report["skipped_redundant_events"] += len(post_step_events)
+                    record_skipped_step(
+                        report,
+                        original_slide_number,
+                        original_slide_path,
+                        f"{step}+post",
+                        skipped_post_event_details,
+                        keep_details=keep_report_details,
+                    )
 
                 post_step_events = next_post_step_events
 
@@ -3360,119 +3705,33 @@ def split_pptx_static(input_path, output_path):
         for name, data in new_entries.items():
             zout.writestr(name, data)
 
-    print("Terminé.")
-    print(f"Slides originales       : {total_original}")
-    print(f"Slides générées         : {total_generated}")
-    print(f"Événements supportés    : {total_events}")
-    print(f"Événements ignorés      : {total_ignored}")
-    if report["closed_or_zero_motion_paths"]:
-        print(
-            "Motion paths fermés/nuls : "
-            f"{report['closed_or_zero_motion_paths']} "
-            "(animation dynamique sans état final statique distinct)"
+    summary = {
+        "report": report,
+        "output_path": report_output_path if report_output_path is not None else output_path,
+        "total_original": total_original,
+        "total_generated": total_generated,
+        "total_events": total_events,
+        "total_ignored": total_ignored,
+        "report_level": report_level,
+    }
+
+    if print_report:
+        print_conversion_report(
+            summary["report"],
+            summary["output_path"],
+            summary["total_original"],
+            summary["total_generated"],
+            summary["total_events"],
+            summary["total_ignored"],
+            summary["report_level"],
         )
 
-    if report["unsupported_motion_paths"]:
-        print(
-            "Motion paths non supportés : "
-            f"{report['unsupported_motion_paths']} "
-            "(chemin non interprétable par le convertisseur)"
-        )
-
-    if report["skipped_redundant_events"]:
-        print(
-            "Étapes sans changement visible : "
-            f"{report['skipped_redundant_events']} "
-            "(non exportées comme slides séparées)"
-        )
-
-    unsupported_text_total = (
-        report["unsupported_text_by_word"]
-        + report["unsupported_text_by_letter"]
-        + report["unsupported_text_by_character"]
-    )
-
-    if unsupported_text_total:
-        print(
-            "Animations texte non supportées : "
-            f"{unsupported_text_total} "
-            "(mot par mot / lettre par lettre / caractère par caractère ; "
-            "non converties en V1)"
-        )
-
-        if report["unsupported_text_by_word"]:
-            print(f"  - mot par mot       : {report['unsupported_text_by_word']}")
-
-        if report["unsupported_text_by_letter"]:
-            print(f"  - lettre par lettre : {report['unsupported_text_by_letter']}")
-
-        if report["unsupported_text_by_character"]:
-            print(f"  - plage caractères  : {report['unsupported_text_by_character']}")
+    return summary
     
-    if report["unsupported_scale_animations"]:
-        print(
-            "Animations Grow/Shrink non supportées : "
-            f"{report['unsupported_scale_animations']} "
-            "(facteur de taille non interprétable)"
-        )
-
-    if report["neutral_scale_animations"]:
-        print(
-            "Animations Grow/Shrink neutres : "
-            f"{report['neutral_scale_animations']} "
-            "(aucun changement de taille final)"
-        )
     
-    if report["unsupported_rotation_animations"]:
-        print(
-            "Animations de rotation non supportées : "
-            f"{report['unsupported_rotation_animations']} "
-            "(angle de rotation non interprétable)"
-        )
-
-    if report["neutral_rotation_animations"]:
-        print(
-            "Animations de rotation neutres : "
-            f"{report['neutral_rotation_animations']} "
-            "(aucun changement d'angle final)"
-        )
-
-    if report["unsupported_opacity_animations"]:
-        print(
-            "Animations de transparence non supportées : "
-            f"{report['unsupported_opacity_animations']} "
-            "(opacité finale non interprétable)"
-        )
-
-    if report["unsupported_color_animations"]:
-        print(
-            "Animations de couleur non supportées : "
-            f"{report['unsupported_color_animations']} "
-            "(cible ou couleur finale non interprétable)"
-        )
-    
-    if report["unsupported_text_style_animations"]:
-        print(
-            "Animations de style texte non supportées : "
-            f"{report['unsupported_text_style_animations']} "
-            "(gras / italique / souligné / barré non interprétable)"
-        )
-
-    print(f"Sortie                  : {output_path}")
-
-
 # =============================================================================
 # PDF export
 # =============================================================================
-
-def default_static_pptx_path(input_path):
-    input_path = Path(input_path)
-
-    if input_path.suffix:
-        return input_path.with_name(f"{input_path.stem}_split{input_path.suffix}")
-
-    return input_path.with_name(f"{input_path.name}_split")
-
 
 def default_pdf_output_path(input_path):
     input_path = Path(input_path)
@@ -3494,9 +3753,7 @@ def resolve_soffice_executable(soffice=None):
                 "soffice",
                 "libreoffice",
                 "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-                r"C:\Program Files\LibreOffice\program\soffice.com",
                 r"C:\Program Files\LibreOffice\program\soffice.exe",
-                r"C:\Program Files (x86)\LibreOffice\program\soffice.com",
                 r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
             ]
         )
@@ -3513,8 +3770,9 @@ def resolve_soffice_executable(soffice=None):
             return str(candidate_path)
 
     raise RuntimeError(
-        "PDF export requires LibreOffice. Install LibreOffice and make sure "
-        "the `soffice` executable is available, or pass its path with --soffice."
+        "PDF export requires LibreOffice. "
+        "Install LibreOffice or pass the path to the soffice executable with "
+        "--soffice."
     )
 
 
@@ -3537,33 +3795,26 @@ def export_pdf_with_libreoffice(
         profile_dir = tmpdir / "lo-profile"
         profile_dir.mkdir(parents=True, exist_ok=True)
 
-        command = [
-            soffice_path,
-            "--headless",
-            "--nologo",
-            "--nofirststartwizard",
-            "--norestore",
-            f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
-            "--convert-to",
-            "pdf:impress_pdf_Export",
-            "--outdir",
-            str(tmpdir),
-            str(pptx_path),
-        ]
-
-        try:
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"LibreOffice PDF export timed out after {timeout} seconds."
-            ) from exc
+        result = subprocess.run(
+            [
+                soffice_path,
+                "--headless",
+                "--nologo",
+                "--nofirststartwizard",
+                "--norestore",
+                f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+                "--convert-to",
+                "pdf:impress_pdf_Export",
+                "--outdir",
+                str(tmpdir),
+                str(pptx_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
 
         if result.returncode != 0:
             raise RuntimeError(
@@ -3586,18 +3837,79 @@ def export_pdf_with_libreoffice(
         generated_pdf.replace(pdf_path)
 
 
-def default_output_path(input_path, output_format="pptx"):
+def convert_presentation(
+    input_path,
+    output_path,
+    output_format="pptx",
+    report_level="summary",
+    soffice=None,
+    pdf_timeout=120,
+):
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     if output_format == "pptx":
-        return default_static_pptx_path(input_path)
+        return split_pptx_static(
+            input_path,
+            output_path,
+            report_level=report_level,
+        )
+
+    if output_format == "pdf":
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_pptx_path = Path(tmpdir) / f"{input_path.stem}_split.pptx"
+
+            summary = split_pptx_static(
+                input_path,
+                tmp_pptx_path,
+                report_level=report_level,
+                report_output_path=output_path,
+                print_report=False,
+            )
+
+            export_pdf_with_libreoffice(
+                tmp_pptx_path,
+                output_path,
+                soffice=soffice,
+                timeout=pdf_timeout,
+            )
+
+            print_conversion_report(
+                summary["report"],
+                summary["output_path"],
+                summary["total_original"],
+                summary["total_generated"],
+                summary["total_events"],
+                summary["total_ignored"],
+                summary["report_level"],
+            )
+
+            return summary
+
+    raise ValueError(f"Unsupported output format: {output_format!r}")
+    
+    
+# =============================================================================
+# CLI
+# =============================================================================
+
+def default_output_path(input_path, output_format="pptx"):
+    input_path = Path(input_path)
 
     if output_format == "pdf":
         return default_pdf_output_path(input_path)
 
-    raise ValueError(f"Unsupported output format: {output_format!r}")
+    if input_path.suffix:
+        return input_path.with_name(f"{input_path.stem}_split{input_path.suffix}")
+
+    return input_path.with_name(f"{input_path.name}_split")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert an animated PPTX into a static PPTX or PDF with one slide per animation state."
+        description="Convert an animated PPTX into a static PPTX with one slide per animation state."
     )
 
     parser.add_argument(
@@ -3606,27 +3918,30 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help=(
+            "Output file. If omitted, _split is appended to the input file name "
+            "and the extension is chosen from --format."
+        ),
+    )
+
+    parser.add_argument(
         "-f",
         "--format",
         choices=("pptx", "pdf"),
         default="pptx",
         dest="output_format",
-        help="Output format: pptx = static PPTX, pdf = PDF exported with LibreOffice.",
-    )
-
-    parser.add_argument(
-        "-o",
-        "--output",
-        default=None,
-        help="Output file. If omitted, _split is appended to the input file name with the selected format.",
+        help="Output format: pptx = static PPTX, pdf = PDF exported through LibreOffice.",
     )
 
     parser.add_argument(
         "--soffice",
         default=None,
         help=(
-            "Path to the LibreOffice soffice executable. Used only when "
-            "--format=pdf. If omitted, the script searches common locations."
+            "Path to the LibreOffice soffice executable. If omitted, the script "
+            "searches for soffice/libreoffice in common locations."
         ),
     )
 
@@ -3635,6 +3950,20 @@ if __name__ == "__main__":
         type=int,
         default=120,
         help="Maximum time in seconds allowed for LibreOffice PDF export.",
+    )
+
+    parser.add_argument(
+        "--report",
+        "--report-level",
+        choices=("none", "summary", "detail"),
+        default="summary",
+        dest="report_level",
+        help=(
+            "Conversion report level: "
+            "none = no report, "
+            "summary = aggregate counts, "
+            "detail = skipped animation steps with original slide numbers and reasons."
+        ),
     )
 
     args = parser.parse_args()
@@ -3649,19 +3978,17 @@ if __name__ == "__main__":
     if input_path.resolve() == output_path.resolve():
         raise ValueError("The output file must not overwrite the input file.")
 
-    if args.output_format == "pptx":
-        split_pptx_static(input_path, output_path)
+    if args.soffice and args.output_format != "pdf":
+        parser.error("--soffice is only meaningful with --format=pdf")
 
-    elif args.output_format == "pdf":
-        with tempfile.TemporaryDirectory() as tmpdir:
-            static_pptx_path = Path(tmpdir) / default_static_pptx_path(input_path).name
-            split_pptx_static(input_path, static_pptx_path)
+    if args.pdf_timeout != 120 and args.output_format != "pdf":
+        parser.error("--pdf-timeout is only meaningful with --format=pdf")
 
-            export_pdf_with_libreoffice(
-                static_pptx_path,
-                output_path,
-                soffice=args.soffice,
-                timeout=args.pdf_timeout,
-            )
-
-        print(f"PDF output              : {output_path}")
+    convert_presentation(
+        input_path,
+        output_path,
+        output_format=args.output_format,
+        report_level=args.report_level,
+        soffice=args.soffice,
+        pdf_timeout=args.pdf_timeout,
+    )
