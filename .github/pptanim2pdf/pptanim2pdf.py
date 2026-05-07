@@ -36,10 +36,22 @@ SLIDE_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentation
 
 SLIDE_RE = re.compile(r"^ppt/slides/slide\d+\.xml$")
 SLIDE_RELS_RE = re.compile(r"^ppt/slides/_rels/slide\d+\.xml\.rels$")
+TAG_RE = re.compile(r"^ppt/tags/.*\.xml$")
+TAG_PARTNAME_RE = re.compile(r"^/ppt/tags/.*\.xml$")
 
 FULL_TURN = 360 * 60000
 
 TEXT_STYLE_KINDS = {"bold", "italic", "underline", "strike"}
+
+TEXT_STYLE_WIDTH_EXPANDING_KINDS = {"bold"}
+
+# Extra width used to compensate for LibreOffice text wrapping after
+# Bold text-style animations.
+TEXT_STYLE_WIDTH_PADDING_RATIO = 0.06
+
+# PowerPoint's common default internal text margin is 0.1 inch = 91440 EMU.
+# If rIns is absent, we treat it as this default value.
+DEFAULT_TEXT_BODY_INSET_EMU = 91440
 
 def qn(ns, tag):
     return f"{{{ns}}}{tag}"
@@ -87,6 +99,29 @@ def remove_timing_and_transition(slide_root):
         if el.tag in {qn(P, "timing"), qn(P, "transition")}:
             slide_root.remove(el)
 
+def remove_slide_tag_references(slide_root):
+    """
+    Remove slide and shape tag references from generated slide copies.
+
+    Tags are custom metadata attached through slide relationships. Reusing the
+    same tag parts from several generated slides can make PowerPoint repair the
+    output package. These tags are not needed for static rendering.
+    """
+    for tag_ref in slide_root.xpath(".//p:custDataLst/p:tags", namespaces=NS):
+        parent = tag_ref.getparent()
+
+        if parent is not None:
+            parent.remove(tag_ref)
+
+    for cust_data_lst in slide_root.xpath(".//p:custDataLst", namespaces=NS):
+        if len(cust_data_lst) != 0:
+            continue
+
+        parent = cust_data_lst.getparent()
+
+        if parent is not None:
+            parent.remove(cust_data_lst)
+
 def is_inside_mc_fallback(el):
     cur = el.getparent()
 
@@ -110,7 +145,14 @@ def clean_slide_rels(rels_data):
     for rel in list(root):
         rel_type = rel.get("Type", "")
 
-        if rel_type.endswith(("/notesSlide", "/comments", "/commentAuthors")):
+        if rel_type.endswith(
+            (
+                "/notesSlide",
+                "/comments",
+                "/commentAuthors",
+                "/tags",
+            )
+        ):
             root.remove(rel)
 
     return xml_bytes(root)
@@ -2057,6 +2099,84 @@ def apply_shape_text_style(shape, text_style, value, paragraph_index=None):
 
     return applied
 
+def int_attr_or_default(el, attr_name, default):
+    raw_value = el.get(attr_name)
+
+    if raw_value is None:
+        return default
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
+def text_body_properties(shape):
+    return shape.find("./p:txBody/a:bodyPr", namespaces=NS)
+
+
+def apply_text_style_width_compensation(shape, width_ratio):
+    """
+    Compensate for LibreOffice text wrapping after Bold animations.
+
+    The compensation is applied from left to right:
+    - first reduce the right internal text margin, if available;
+    - then extend the shape width by the remaining amount.
+
+    The left position is intentionally preserved.
+    """
+    if width_ratio <= 0:
+        return False
+
+    xfrm = shape_transform_element(shape)
+
+    if xfrm is None:
+        return False
+
+    ext = xfrm.find("./a:ext", namespaces=NS)
+
+    if ext is None:
+        return False
+
+    try:
+        cx = int(ext.get("cx", "0"))
+    except ValueError:
+        return False
+
+    if cx <= 0:
+        return False
+
+    required_extra = int(round(cx * width_ratio))
+
+    if required_extra <= 0:
+        return False
+
+    remaining_extra = required_extra
+    applied = False
+
+    body_pr = text_body_properties(shape)
+
+    if body_pr is not None:
+        right_inset = int_attr_or_default(
+            body_pr,
+            "rIns",
+            DEFAULT_TEXT_BODY_INSET_EMU,
+        )
+
+        removable_inset = max(0, right_inset)
+        removed_inset = min(removable_inset, remaining_extra)
+
+        if removed_inset > 0:
+            body_pr.set("rIns", str(right_inset - removed_inset))
+            remaining_extra -= removed_inset
+            applied = True
+
+    if remaining_extra > 0:
+        ext.set("cx", str(cx + remaining_extra))
+        applied = True
+
+    return applied
+
 def replace_fill_child(parent, color_el, insert_before_tags=None):
     if insert_before_tags is None:
         insert_before_tags = set()
@@ -2537,7 +2657,7 @@ def append_shape_transform(shape_transforms, sid, transform):
 def apply_shape_transform(shape, transform):
     """
     Apply one elementary transform to a shape.
-    
+
     This function centralizes transform application and makes it possible to
     add new effects without changing the main loop.
     """
@@ -2579,12 +2699,24 @@ def apply_shape_transform(shape, transform):
         )
 
     if action == "text_style":
-        return apply_shape_text_style(
+        applied = apply_shape_text_style(
             shape,
             transform["text_style"],
             transform["value"],
             transform.get("paragraph_index"),
         )
+
+        width_ratio = transform.get("width_padding_ratio", 0.0)
+
+        if applied and width_ratio > 0:
+            compensated = apply_text_style_width_compensation(
+                shape,
+                width_ratio,
+            )
+
+            return applied or compensated
+
+        return applied
 
     return False
 
@@ -2845,6 +2977,15 @@ def append_color_transform(
         },
     )
 
+def shape_already_has_width_compensation(shape_transforms, sid):
+    for transform in shape_transforms.get(sid, []):
+        if transform.get("action") != "text_style":
+            continue
+
+        if transform.get("width_padding_ratio", 0.0) > 0:
+            return True
+
+    return False
 
 def apply_timeline_event(
     event,
@@ -2854,10 +2995,11 @@ def apply_timeline_event(
     shape_style_state,
     post_step_events=None,
     color_post_mode=False,
+    text_style_width_compensation=True,
 ):
     """
     Apply one event to the current slide state.
-    
+
     post_step_events is used for from -> to color effects: the from state is
     applied in the current step if needed, then the to state is applied in a
     shared post-animation step.
@@ -3026,15 +3168,34 @@ def apply_timeline_event(
         else:
             return
 
+        current_value = text_style_state_value(
+            shape_style_state,
+            target,
+            text_style,
+        )
+
+        needs_width_compensation = (
+            text_style_width_compensation
+            and value is True
+            and text_style in TEXT_STYLE_WIDTH_EXPANDING_KINDS
+            and current_value != value
+            and not shape_already_has_width_compensation(shape_transforms, sid)
+        )
+
+        transform = {
+            "action": "text_style",
+            "text_style": text_style,
+            "value": value,
+            "paragraph_index": paragraph_index,
+        }
+
+        if needs_width_compensation:
+            transform["width_padding_ratio"] = TEXT_STYLE_WIDTH_PADDING_RATIO
+
         append_shape_transform(
             shape_transforms,
             sid,
-            {
-                "action": "text_style",
-                "text_style": text_style,
-                "value": value,
-                "paragraph_index": paragraph_index,
-            },
+            transform,
         )
 
         set_text_style_state_value(
@@ -3068,10 +3229,11 @@ def apply_timeline_events(
     shape_style_state,
     force_emit=False,
     skipped_event_details=None,
+    text_style_width_compensation=True,
 ):
     """
     Apply the events of one step in order.
-    
+
     Returns:
       - emit_slide: whether a slide should be emitted after application;
       - post_step_events: events to apply after the current emission.
@@ -3112,10 +3274,10 @@ def apply_timeline_events(
             shape_style_state,
             post_step_events,
             color_post_mode,
+            text_style_width_compensation,
         )
 
     return emit_slide, post_step_events
-
 
 
 # =============================================================================
@@ -3403,6 +3565,7 @@ def write_static_slide(
     apply_transforms_to_slide(new_slide_root, shape_transforms)
 
     remove_timing_and_transition(new_slide_root)
+    remove_slide_tag_references(new_slide_root)
 
     new_slide_path = f"ppt/slides/slide{new_slide_index}.xml"
     new_rels_path = f"ppt/slides/_rels/slide{new_slide_index}.xml.rels"
@@ -3437,6 +3600,7 @@ def split_pptx_static(
     report_level="summary",
     report_output_path=None,
     print_report=True,
+    text_style_width_compensation=True,
 ):
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -3532,7 +3696,11 @@ def split_pptx_static(
     new_entries = {
         name: data
         for name, data in entries.items()
-        if not SLIDE_RE.match(name) and not SLIDE_RELS_RE.match(name)
+        if (
+            not SLIDE_RE.match(name)
+            and not SLIDE_RELS_RE.match(name)
+            and not TAG_RE.match(name)
+        )
     }
 
     for rel in list(pres_rels_root):
@@ -3554,7 +3722,10 @@ def split_pptx_static(
 
         part_name = child.get("PartName", "")
 
-        if re.match(r"^/ppt/slides/slide\d+\.xml$", part_name):
+        if (
+            re.match(r"^/ppt/slides/slide\d+\.xml$", part_name)
+            or TAG_PARTNAME_RE.match(part_name)
+        ):
             ct_root.remove(child)
 
     new_slide_index = 1
@@ -3621,6 +3792,7 @@ def split_pptx_static(
                 shape_style_state,
                 force_emit=(step == 0),
                 skipped_event_details=skipped_event_details,
+                text_style_width_compensation=text_style_width_compensation,
             )
 
             if not emit_slide:
@@ -3664,6 +3836,7 @@ def split_pptx_static(
                     shape_style_state,
                     force_emit=False,
                     skipped_event_details=skipped_post_event_details,
+                    text_style_width_compensation=text_style_width_compensation,
                 )
 
                 if emit_post_slide:
@@ -3847,6 +4020,7 @@ def convert_presentation(
     report_level="summary",
     soffice=None,
     pdf_timeout=120,
+    text_style_width_compensation=True,
 ):
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -3858,8 +4032,8 @@ def convert_presentation(
             input_path,
             output_path,
             report_level=report_level,
+            text_style_width_compensation=text_style_width_compensation,
         )
-
     if output_format == "pdf":
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_pptx_path = Path(tmpdir) / f"{input_path.stem}_split.pptx"
@@ -3870,6 +4044,7 @@ def convert_presentation(
                 report_level=report_level,
                 report_output_path=output_path,
                 print_report=False,
+                text_style_width_compensation=text_style_width_compensation,
             )
 
             export_pdf_with_libreoffice(
@@ -3969,6 +4144,17 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--no-text-style-width-compensation",
+        action="store_false",
+        dest="text_style_width_compensation",
+        default=True,
+        help=(
+            "Disable the text-box width compensation applied by default after "
+            "Bold text-style animations."
+        ),
+    )
+
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -3994,4 +4180,5 @@ if __name__ == "__main__":
         report_level=args.report_level,
         soffice=args.soffice,
         pdf_timeout=args.pdf_timeout,
+        text_style_width_compensation=args.text_style_width_compensation,
     )
