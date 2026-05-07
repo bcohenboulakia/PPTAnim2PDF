@@ -13,15 +13,17 @@ PPTAnim2PDF requires Python 3 and `lxml`.
 ## Usage
 
 ```bash
-pptanim2pdf.py [-h] [-o OUTPUT] [--report {none,summary,detail}] input
+pptanim2pdf.py [-h] [-o OUTPUT] [-f {pptx,pdf}] [--report {none,summary,detail}] [--no-text-style-width-compensation] input
 ```
 
-Convert an animated PPTX into a static PPTX with one slide per animation state.
+Convert an animated PPTX into a static PPTX or PDF with one slide/page per animation state.
 
 - `input`: Input PPTX file.
 - `-h`, `--help`: Show this help message and exit.
-- `-o OUTPUT`, `--output OUTPUT`: Output PPTX file. If omitted, `_split` is appended to the input file name.
+- `-o OUTPUT`, `--output OUTPUT`: Output file. If omitted, `_split` is appended to the input file name for PPTX output, while PDF output reuses the input stem with the `.pdf` extension.
+- `-f {pptx,pdf}`, `--format {pptx,pdf}`: Output format. `pptx` generates a static PPTX. `pdf` generates a PDF by first creating a temporary static PPTX and then exporting it with LibreOffice in headless mode.
 - `--report {none,summary,detail}`, `--report-level {none,summary,detail}`: Controls the conversion report. `none` disables the report, `summary` prints aggregate counts, and `detail` also lists skipped animation steps with the original slide number and the reason why no separate static slide was generated.
+- `--no-text-style-width-compensation`: Disables the default width compensation applied to text boxes when a Bold text-style animation may make the text wider. By default, PPTAnim2PDF tries to prevent unwanted line wrapping in LibreOffice/PDF rendering.
 
 ## Compatibility
 
@@ -49,6 +51,7 @@ PPTAnim2PDF converts supported animations into explicit slide states. It flatten
 - Detected Fill Color and Line Color effects apply the final fill or line color.
 - Detected Font Color effects apply the final text color.
 - Detected Bold, Italic, Underline, and Strikethrough effects apply the final text style.
+- For Bold text-style animations, PPTAnim2PDF also tries to compensate for the increased text width: it estimates the extra width, reduces the right text padding first, and then widens the object if the padding is not enough. This behavior can be disabled with `--no-text-style-width-compensation`.
 - Some “After animation” effects are converted when they correspond to a static final state, such as dimming text or hiding an object after an animation.
 
 The following animation variants are supported during conversion:
