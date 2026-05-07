@@ -1,0 +1,145 @@
+name: Convert PPTX
+
+on:
+  workflow_dispatch:
+    inputs:
+      input:
+        description: "Input PPTX file"
+        required: true
+        default: "slides/course.pptx"
+      output:
+        description: "Output file. If empty, derived from input and format."
+        required: false
+        default: ""
+      format:
+        description: "Output format"
+        required: true
+        default: "pdf"
+        type: choice
+        options:
+          - pptx
+          - pdf
+      report:
+        description: "Conversion report level"
+        required: true
+        default: "summary"
+        type: choice
+        options:
+          - none
+          - summary
+          - detail
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare-image:
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          REPO="${REPO,,}"
+
+          HASH=$(
+            sha256sum \
+              .github/pptanim2pdf/Dockerfile \
+              .github/pptanim2pdf/pptanim2pdf.py \
+            | sha256sum \
+            | cut -d' ' -f1
+          )
+
+          IMAGE="ghcr.io/${OWNER}/${REPO}-pptanim2pdf:${HASH}"
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Using image: $IMAGE"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether image already exists
+        id: check
+        run: |
+          if docker manifest inspect "${{ steps.meta.outputs.image }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image already exists."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Image does not exist yet."
+          fi
+
+      - name: Build and push image if missing
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .github/pptanim2pdf
+          file: .github/pptanim2pdf/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+
+  convert:
+    needs: prepare-image
+    runs-on: ubuntu-latest
+
+    container:
+      image: ${{ needs.prepare-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute output path
+        id: paths
+        run: |
+          INPUT="${{ inputs.input }}"
+          OUTPUT="${{ inputs.output }}"
+          FORMAT="${{ inputs.format }}"
+
+          if [ -z "$OUTPUT" ]; then
+            BASE="${INPUT%.*}"
+
+            if [ "$FORMAT" = "pdf" ]; then
+              OUTPUT="${BASE}_split.pdf"
+            else
+              OUTPUT="${BASE}_split.pptx"
+            fi
+          fi
+
+          mkdir -p "$(dirname "$OUTPUT")"
+
+          echo "input=$INPUT" >> "$GITHUB_OUTPUT"
+          echo "output=$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "format=$FORMAT" >> "$GITHUB_OUTPUT"
+
+          echo "Input : $INPUT"
+          echo "Output: $OUTPUT"
+          echo "Format: $FORMAT"
+
+      - name: Convert presentation
+        run: |
+          pptanim2pdf \
+            "${{ steps.paths.outputs.input }}" \
+            --format="${{ steps.paths.outputs.format }}" \
+            -o "${{ steps.paths.outputs.output }}" \
+            --report="${{ inputs.report }}"
+
+      - name: Upload converted file
+        uses: actions/upload-artifact@v4
+        with:
+          name: converted-presentation
+          path: ${{ steps.paths.outputs.output }}
