@@ -118,7 +118,7 @@ jobs:
             BASE="${INPUT%.*}"
 
             if [ "$FORMAT" = "pdf" ]; then
-              OUTPUT="${BASE}_split.pdf"
+              OUTPUT="${BASE}.pdf"
             else
               OUTPUT="${BASE}_split.pptx"
             fi

@@ -3733,13 +3733,16 @@ def split_pptx_static(
 # PDF export
 # =============================================================================
 
-def default_pdf_output_path(input_path):
+def default_output_path(input_path, output_format="pptx"):
     input_path = Path(input_path)
 
-    if input_path.suffix:
-        return input_path.with_name(f"{input_path.stem}_split.pdf")
+    if output_format == "pdf":
+        return default_pdf_output_path(input_path)
 
-    return input_path.with_name(f"{input_path.name}_split.pdf")
+    if input_path.suffix:
+        return input_path.with_name(f"{input_path.stem}_split{input_path.suffix}")
+
+    return input_path.with_name(f"{input_path.name}_split")
 
 
 def resolve_soffice_executable(soffice=None):
