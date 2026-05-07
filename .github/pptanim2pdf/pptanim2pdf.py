@@ -3834,7 +3834,7 @@ def export_pdf_with_libreoffice(
             )
 
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
-        generated_pdf.replace(pdf_path)
+        shutil.move(str(generated_pdf), str(pdf_path))
 
 
 def convert_presentation(
