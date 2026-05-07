@@ -1,4 +1,4 @@
-<p align="center"><img width="200" alt="PPTAnim2PDF" src="https://github.com/user-attachments/assets/4c647bf0-299a-4cce-afc0-84c2f72257c6" /></p>
+<p align="center"><img width="200" alt="PPTAnim2PDF" src="https://github.com/user-attachments/assets/a86ee40a-6d44-4d8c-9e51-456552d84a05" /></p>
 
 # PPTAnim2PDF
 
