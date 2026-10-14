@@ -31,253 +31,265 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
-  prepare-image:
-    runs-on: ubuntu-latest
-
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Compute image tag
-        id: meta
-        shell: bash
-        run: |
-          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
-          REPO="${GITHUB_REPOSITORY#*/}"
-          REPO="${REPO,,}"
-
-          HASH=$(
-            sha256sum \
-              .github/pptanim2pdf/Dockerfile \
-              .github/pptanim2pdf/pptanim2pdf.py \
-            | sha256sum \
-            | cut -d' ' -f1
-          )
-
-          IMAGE="ghcr.io/${OWNER}/${REPO}-pptanim2pdf:${HASH}"
-
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "Using image: $IMAGE"
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check whether image already exists
-        id: check
-        shell: bash
-        run: |
-          if docker manifest inspect "${{ steps.meta.outputs.image }}" > /dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image already exists."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Image does not exist yet."
-          fi
-
-      - name: Build and push image if missing
-        if: steps.check.outputs.exists == 'false'
-        uses: docker/build-push-action@v7
-        with:
-          context: .github/pptanim2pdf
-          file: .github/pptanim2pdf/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.image }}
-
   convert:
-    needs: prepare-image
-    runs-on: ubuntu-latest
+    runs-on: windows-2022
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Install latest office2pdf
-        if: inputs.format == 'pdf'
-        id: office2pdf
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-crosextra-carlito
-
-          TAG="$(gh release view --repo developer0hye/office2pdf --json tagName --jq '.tagName')"
-          TMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "$TMP_DIR"' EXIT
-
-          gh release download "$TAG" --repo developer0hye/office2pdf --pattern '*x86_64-unknown-linux-musl.tar.gz' --dir "$TMP_DIR"
-
-          ARCHIVE="$(find "$TMP_DIR" -maxdepth 1 -type f -name '*x86_64-unknown-linux-musl.tar.gz' -print -quit)"
-
-          if [ -z "$ARCHIVE" ]; then
-            echo "office2pdf release archive not found." >&2
-            exit 1
-          fi
-
-          tar -xzf "$ARCHIVE" -C "$TMP_DIR"
-
-          BIN="$(find "$TMP_DIR" -type f -name office2pdf -print -quit)"
-
-          if [ -z "$BIN" ]; then
-            echo "office2pdf executable not found in release archive." >&2
-            exit 1
-          fi
-
-          sudo install -m 0755 "$BIN" /usr/local/bin/office2pdf
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          office2pdf --version
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          python-version: '3.12'
+
+      - name: Install PPTAnim2PDF dependency
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check lxml
 
       - name: Compute output path
         id: paths
-        shell: bash
+        shell: pwsh
+        env:
+          INPUT_PATH: ${{ inputs.input }}
+          OUTPUT_PATH: ${{ inputs.output }}
+          OUTPUT_FORMAT: ${{ inputs.format }}
         run: |
-          INPUT="${{ inputs.input }}"
-          OUTPUT="${{ inputs.output }}"
-          FORMAT="${{ inputs.format }}"
+          $ErrorActionPreference = 'Stop'
+          $inputFile = $env:INPUT_PATH
+          $outputFile = $env:OUTPUT_PATH
+          $format = $env:OUTPUT_FORMAT
 
-          if [ -z "$OUTPUT" ]; then
-            BASE="${INPUT%.*}"
+          if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+            throw "Input PPTX not found: $inputFile"
+          }
+          if ([string]::IsNullOrWhiteSpace($outputFile)) {
+            if ($format -eq 'pdf') {
+              $outputFile = [IO.Path]::ChangeExtension($inputFile, '.pdf')
+            } else {
+              $directory = Split-Path -Parent $inputFile
+              if (-not $directory) { $directory = '.' }
+              $outputFile = Join-Path $directory (([IO.Path]::GetFileNameWithoutExtension($inputFile)) + '_split.pptx')
+            }
+          }
+          if ([IO.Path]::GetFullPath($inputFile) -eq [IO.Path]::GetFullPath($outputFile)) {
+            throw 'Output must not overwrite input.'
+          }
+          $parent = Split-Path -Parent $outputFile
+          if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
 
-            if [ "$FORMAT" = "pdf" ]; then
-              OUTPUT="${BASE}.pdf"
-            else
-              OUTPUT="${BASE}_split.pptx"
-            fi
-          fi
+          "input=$inputFile" >> $env:GITHUB_OUTPUT
+          "output=$outputFile" >> $env:GITHUB_OUTPUT
+          "format=$format" >> $env:GITHUB_OUTPUT
+          Write-Host "Input: $inputFile | Output: $outputFile | Format: $format"
 
-          mkdir -p "$(dirname "$OUTPUT")"
+      - name: Check fonts on Windows runner
+        if: inputs.format == 'pdf'
+        shell: pwsh
+        env:
+          INPUT_PATH: ${{ steps.paths.outputs.input }}
+        run: |
+          # Best-effort Latin font check. Does not alter the PPTX or block conversion.
+          $ErrorActionPreference = 'Stop'
+          try {
+            Add-Type -AssemblyName System.Drawing
+            Add-Type -AssemblyName System.IO.Compression
+            $installed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($f in ([System.Drawing.Text.InstalledFontCollection]::new()).Families) {
+              [void]$installed.Add($f.Name)
+            }
+            $needed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $env:INPUT_PATH).Path)
+            try {
+              function Read-PptxXml($zip, $name) {
+                $part = $zip.GetEntry($name)
+                if ($null -eq $part) { return $null }
+                $stream = $part.Open()
+                $reader = [IO.StreamReader]::new($stream)
+                try { return [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
+              }
+              $ns = [Xml.XmlNamespaceManager]::new(([xml]'<root/>').NameTable)
+              $ns.AddNamespace('p', 'http://schemas.openxmlformats.org/presentationml/2006/main')
+              $ns.AddNamespace('a', 'http://schemas.openxmlformats.org/drawingml/2006/main')
+              $themePart = @($archive.Entries | Where-Object FullName -Match '^ppt/theme/theme\d+\.xml$' | Sort-Object FullName | Select-Object -First 1)
+              $theme = if ($themePart.Count) { Read-PptxXml $archive $themePart[0].FullName } else { $null }
+              $major = ''; $minor = ''
+              if ($null -ne $theme) {
+                $major = $theme.SelectSingleNode('//a:fontScheme/a:majorFont/a:latin', $ns).GetAttribute('typeface')
+                $minor = $theme.SelectSingleNode('//a:fontScheme/a:minorFont/a:latin', $ns).GetAttribute('typeface')
+              }
+              function Resolve-Face([string]$name) {
+                if ($name -match '^\+mj-') { return $major }
+                if ($name -match '^\+mn-') { return $minor }
+                return $name
+              }
+              $slideParts = @($archive.Entries | Where-Object FullName -Match '^ppt/slides/slide\d+\.xml$')
+              foreach ($part in $slideParts) {
+                $slide = Read-PptxXml $archive $part.FullName
+                foreach ($shape in $slide.SelectNodes('//p:sp[p:txBody]', $ns)) {
+                  $placeholder = $shape.SelectSingleNode('./p:nvSpPr/p:nvPr/p:ph', $ns)
+                  $default = if ($null -ne $placeholder -and $placeholder.GetAttribute('type') -in @('title', 'ctrTitle')) { $major } else { $minor }
+                  foreach ($para in $shape.SelectNodes('./p:txBody/a:p', $ns)) {
+                    $pFontNode = $para.SelectSingleNode('./a:pPr/a:defRPr/a:latin', $ns)
+                    $pFont = if ($null -ne $pFontNode) { $pFontNode.GetAttribute('typeface') } else { '' }
+                    $level = 1
+                    $ppr = $para.SelectSingleNode('./a:pPr', $ns)
+                    if ($null -ne $ppr -and $ppr.HasAttribute('lvl')) { $level = [Math]::Max(1, [Math]::Min(9, [int]$ppr.GetAttribute('lvl') + 1)) }
+                    $bodyFontNode = $shape.SelectSingleNode("./p:txBody/a:lstStyle/a:lvl${level}pPr/a:defRPr/a:latin", $ns)
+                    if ($null -eq $bodyFontNode) { $bodyFontNode = $shape.SelectSingleNode('./p:txBody/a:lstStyle/a:defPPr/a:defRPr/a:latin', $ns) }
+                    $bodyFont = if ($null -ne $bodyFontNode) { $bodyFontNode.GetAttribute('typeface') } else { '' }
+                    foreach ($run in $para.SelectNodes('./a:r|./a:fld', $ns)) {
+                      $text = $run.SelectSingleNode('./a:t', $ns)
+                      if ($null -eq $text -or [string]::IsNullOrWhiteSpace($text.InnerText)) { continue }
+                      $fontNode = $run.SelectSingleNode('./a:rPr/a:latin', $ns)
+                      $font = if ($null -ne $fontNode) { $fontNode.GetAttribute('typeface') } else { '' }
+                      if (-not $font) { $font = if ($pFont) { $pFont } elseif ($bodyFont) { $bodyFont } else { $default } }
+                      $font = Resolve-Face $font
+                      if ($font) { [void]$needed.Add($font) }
+                    }
+                  }
+                }
+                # A basic fallback for text inside slide tables.
+                foreach ($run in $slide.SelectNodes('//a:tbl//a:r', $ns)) {
+                  $text = $run.SelectSingleNode('./a:t', $ns)
+                  if ($null -eq $text -or [string]::IsNullOrWhiteSpace($text.InnerText)) { continue }
+                  $fontNode = $run.SelectSingleNode('./a:rPr/a:latin', $ns)
+                  $font = if ($null -ne $fontNode) { $fontNode.GetAttribute('typeface') } else { $minor }
+                  $font = Resolve-Face $font
+                  if ($font) { [void]$needed.Add($font) }
+                }
+              }
+            } finally {
+              $archive.Dispose()
+            }
+            $missing = @($needed | Where-Object { -not $installed.Contains($_) } | Sort-Object)
+            "`n### Font availability (Windows runner)`n" >> $env:GITHUB_STEP_SUMMARY
+            if ($missing.Count) {
+              $names = $missing -join ', '
+              Write-Host "::warning title=Missing Windows font families::$names"
+              "Missing font families: $names`n" >> $env:GITHUB_STEP_SUMMARY
+            } elseif ($needed.Count) {
+              "All detected Latin font families are installed.`n" >> $env:GITHUB_STEP_SUMMARY
+            } else {
+              "No Latin font families could be identified from slide text.`n" >> $env:GITHUB_STEP_SUMMARY
+            }
+            "*Best-effort check; this does not verify the face selected by office2pdf or all OOXML inheritance.*`n" >> $env:GITHUB_STEP_SUMMARY
+          } catch {
+            Write-Warning "Font audit unavailable; conversion will continue: $_"
+            "`n### Font availability`n`nFont audit could not be completed: $($_.Exception.Message)`n" >> $env:GITHUB_STEP_SUMMARY
+          }
 
-          echo "input=$INPUT" >> "$GITHUB_OUTPUT"
-          echo "output=$OUTPUT" >> "$GITHUB_OUTPUT"
-          echo "format=$FORMAT" >> "$GITHUB_OUTPUT"
+      - name: Install latest office2pdf (Windows)
+        if: inputs.format == 'pdf'
+        id: office2pdf
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = gh release view --repo developer0hye/office2pdf --json tagName --jq '.tagName'
+          if ($LASTEXITCODE -ne 0 -or -not $tag) { throw 'Cannot resolve latest office2pdf release.' }
 
-          echo "Input : $INPUT"
-          echo "Output: $OUTPUT"
-          echo "Format: $FORMAT"
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'office2pdf-download'
+          $extractDir = Join-Path $env:RUNNER_TEMP 'office2pdf-extracted'
+          New-Item -ItemType Directory -Force -Path $downloadDir, $extractDir | Out-Null
+
+          gh release download "$tag" --repo developer0hye/office2pdf --pattern '*x86_64-pc-windows-msvc.zip' --dir "$downloadDir"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download office2pdf $tag for Windows x64." }
+          $archive = @(Get-ChildItem -LiteralPath $downloadDir -Filter '*x86_64-pc-windows-msvc.zip' -File)
+          if ($archive.Count -ne 1) { throw "Expected one Windows archive, found $($archive.Count)." }
+          Expand-Archive -LiteralPath $archive[0].FullName -DestinationPath $extractDir -Force
+          $binaries = @(Get-ChildItem -LiteralPath $extractDir -Filter 'office2pdf.exe' -File -Recurse)
+          if ($binaries.Count -ne 1) { throw "Expected one office2pdf.exe, found $($binaries.Count)." }
+
+          $binDir = Join-Path $env:RUNNER_TEMP 'office2pdf-bin'
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+          $binary = Join-Path $binDir 'office2pdf.exe'
+          Copy-Item -LiteralPath $binaries[0].FullName -Destination $binary -Force
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "binary=$binary" >> $env:GITHUB_OUTPUT
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { throw 'office2pdf executable could not start.' }
 
       - name: Convert presentation
         id: convert
-        shell: bash
+        shell: pwsh
+        env:
+          INPUT_PATH: ${{ steps.paths.outputs.input }}
+          OUTPUT_PATH: ${{ steps.paths.outputs.output }}
+          OUTPUT_FORMAT: ${{ steps.paths.outputs.format }}
+          REPORT_LEVEL: ${{ inputs.report }}
+          OFFICE2PDF_EXE: ${{ steps.office2pdf.outputs.binary }}
+          OFFICE2PDF_TAG: ${{ steps.office2pdf.outputs.tag }}
         run: |
-          set +e
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $reportPath = 'conversion-report.txt'
+          if (Test-Path $reportPath) { Remove-Item $reportPath -Force }
 
-          INPUT="${{ steps.paths.outputs.input }}"
-          OUTPUT="${{ steps.paths.outputs.output }}"
-          FORMAT="${{ steps.paths.outputs.format }}"
-          STATIC_PPTX="$RUNNER_TEMP/pptanim2pdf-static.pptx"
+          if ($env:OUTPUT_FORMAT -eq 'pdf') {
+            $staticPptx = Join-Path $env:RUNNER_TEMP 'pptanim2pdf-static.pptx'
+            '== PPTAnim2PDF: generate static PPTX ==' | Tee-Object -FilePath $reportPath -Append
+            & python .github/pptanim2pdf/pptanim2pdf.py "$env:INPUT_PATH" --format=pptx -o "$staticPptx" "--report=$env:REPORT_LEVEL" 2>&1 | Tee-Object -FilePath $reportPath -Append
+            if ($LASTEXITCODE -ne 0) { throw "PPTAnim2PDF failed ($LASTEXITCODE)." }
 
-          : > conversion-report.txt
+            "== office2pdf $($env:OFFICE2PDF_TAG): generate PDF ==" | Tee-Object -FilePath $reportPath -Append
+            & "$env:OFFICE2PDF_EXE" "$staticPptx" -o "$env:OUTPUT_PATH" 2>&1 | Tee-Object -FilePath $reportPath -Append
+            if ($LASTEXITCODE -ne 0) { throw "office2pdf failed ($LASTEXITCODE)." }
+          } else {
+            & python .github/pptanim2pdf/pptanim2pdf.py "$env:INPUT_PATH" --format=pptx -o "$env:OUTPUT_PATH" "--report=$env:REPORT_LEVEL" 2>&1 | Tee-Object -FilePath $reportPath -Append
+            if ($LASTEXITCODE -ne 0) { throw "PPTAnim2PDF failed ($LASTEXITCODE)." }
+          }
 
-          if [ "$FORMAT" = "pdf" ]; then
-            echo "== PPTAnim2PDF: generate static PPTX ==" >> conversion-report.txt
-
-            docker run --rm \
-              -v "$PWD:/work" \
-              -v "$RUNNER_TEMP:/runner-temp" \
-              -w /work \
-              "${{ needs.prepare-image.outputs.image }}" \
-              "$INPUT" \
-              --format=pptx \
-              -o /runner-temp/pptanim2pdf-static.pptx \
-              --report="${{ inputs.report }}" \
-              >> conversion-report.txt 2>&1
-
-            STATUS=$?
-
-            if [ "$STATUS" -eq 0 ]; then
-              {
-                echo
-                echo "== office2pdf ${{ steps.office2pdf.outputs.tag }}: generate PDF =="
-              } >> conversion-report.txt
-
-              office2pdf "$STATIC_PPTX" -o "$OUTPUT" \
-                >> conversion-report.txt 2>&1
-
-              STATUS=$?
-            fi
-          else
-            docker run --rm \
-              -v "$PWD:/work" \
-              -w /work \
-              "${{ needs.prepare-image.outputs.image }}" \
-              "$INPUT" \
-              --format=pptx \
-              -o "$OUTPUT" \
-              --report="${{ inputs.report }}" \
-              >> conversion-report.txt 2>&1
-
-            STATUS=$?
-          fi
-
-          cat conversion-report.txt
-
-          {
-            echo "## PPTAnim2PDF conversion"
-            echo
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| Input | \`$INPUT\` |"
-            echo "| Output | \`$OUTPUT\` |"
-            echo "| Format | \`$FORMAT\` |"
-
-            if [ "$FORMAT" = "pdf" ]; then
-              echo "| PDF engine | \`office2pdf ${{ steps.office2pdf.outputs.tag }}\` |"
-            fi
-
-            echo "| Report level | \`${{ inputs.report }}\` |"
-            echo "| Status | \`$STATUS\` |"
-            echo
-
-            if [ -s conversion-report.txt ]; then
-              echo "### Converter report"
-              echo
-              echo '```text'
-              cat conversion-report.txt
-              echo '```'
-            else
-              echo "No converter report was produced."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          exit "$STATUS"
+      - name: Conversion summary
+        if: always()
+        shell: pwsh
+        env:
+          INPUT_PATH: ${{ steps.paths.outputs.input }}
+          OUTPUT_PATH: ${{ steps.paths.outputs.output }}
+          OUTPUT_FORMAT: ${{ steps.paths.outputs.format }}
+          OFFICE2PDF_TAG: ${{ steps.office2pdf.outputs.tag }}
+          REPORT_LEVEL: ${{ inputs.report }}
+          CONVERSION_OUTCOME: ${{ steps.convert.outcome }}
+        run: |
+          "`n### PPTAnim2PDF conversion`n" >> $env:GITHUB_STEP_SUMMARY
+          "| Field | Value |`n|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          "| Input | ``$env:INPUT_PATH`` |" >> $env:GITHUB_STEP_SUMMARY
+          "| Output | ``$env:OUTPUT_PATH`` |" >> $env:GITHUB_STEP_SUMMARY
+          "| Format | ``$env:OUTPUT_FORMAT`` |" >> $env:GITHUB_STEP_SUMMARY
+          if ($env:OUTPUT_FORMAT -eq 'pdf') {
+            "| PDF engine | ``office2pdf $env:OFFICE2PDF_TAG`` (Windows) |" >> $env:GITHUB_STEP_SUMMARY
+          }
+          "| Report level | ``$env:REPORT_LEVEL`` |" >> $env:GITHUB_STEP_SUMMARY
+          "| Status | ``$env:CONVERSION_OUTCOME`` |`n" >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path 'conversion-report.txt') {
+            "#### Converter report`n" >> $env:GITHUB_STEP_SUMMARY
+            '```text' >> $env:GITHUB_STEP_SUMMARY
+            Get-Content 'conversion-report.txt' | Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' >> $env:GITHUB_STEP_SUMMARY
+          }
 
       - name: Commit generated file
-        shell: bash
+        shell: pwsh
+        env:
+          OUTPUT_PATH: ${{ steps.paths.outputs.output }}
         run: |
-          OUTPUT="${{ steps.paths.outputs.output }}"
-
-          if [ ! -f "$OUTPUT" ]; then
-            echo "Generated file not found: $OUTPUT"
-            exit 1
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add "$OUTPUT"
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit for $OUTPUT."
+          if (-not (Test-Path -LiteralPath $env:OUTPUT_PATH -PathType Leaf)) {
+            throw "Generated file not found: $env:OUTPUT_PATH"
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -- "$env:OUTPUT_PATH"
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "No changes to commit for $env:OUTPUT_PATH."
             exit 0
-          fi
-
-          git commit -m "Generate converted presentation"
-
-          git push
+          }
+          if ($LASTEXITCODE -ne 1) { throw "git diff failed ($LASTEXITCODE)." }
+          git commit -m 'Generate converted presentation'
+          if ($LASTEXITCODE -ne 0) { throw 'git commit failed.' }
+          git push origin "HEAD:$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw 'git push failed.' }
