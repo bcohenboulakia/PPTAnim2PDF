@@ -99,6 +99,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install latest office2pdf
+        if: inputs.format == 'pdf'
+        id: office2pdf
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="$(gh release view --repo developer0hye/office2pdf --json tagName --jq '.tagName')"
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          gh release download "$TAG" --repo developer0hye/office2pdf --pattern '*x86_64-unknown-linux-musl.tar.gz' --dir "$TMP_DIR"
+
+          ARCHIVE="$(find "$TMP_DIR" -maxdepth 1 -type f -name '*x86_64-unknown-linux-musl.tar.gz' -print -quit)"
+
+          if [ -z "$ARCHIVE" ]; then
+            echo "office2pdf release archive not found." >&2
+            exit 1
+          fi
+
+          tar -xzf "$ARCHIVE" -C "$TMP_DIR"
+
+          BIN="$(find "$TMP_DIR" -type f -name office2pdf -print -quit)"
+
+          if [ -z "$BIN" ]; then
+            echo "office2pdf executable not found in release archive." >&2
+            exit 1
+          fi
+
+          sudo install -m 0755 "$BIN" /usr/local/bin/office2pdf
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          office2pdf --version
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -140,17 +177,53 @@ jobs:
         run: |
           set +e
 
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            "${{ needs.prepare-image.outputs.image }}" \
-            "${{ steps.paths.outputs.input }}" \
-            --format="${{ steps.paths.outputs.format }}" \
-            -o "${{ steps.paths.outputs.output }}" \
-            --report="${{ inputs.report }}" \
-            > conversion-report.txt 2>&1
+          INPUT="${{ steps.paths.outputs.input }}"
+          OUTPUT="${{ steps.paths.outputs.output }}"
+          FORMAT="${{ steps.paths.outputs.format }}"
+          STATIC_PPTX="$RUNNER_TEMP/pptanim2pdf-static.pptx"
 
-          STATUS=$?
+          : > conversion-report.txt
+
+          if [ "$FORMAT" = "pdf" ]; then
+            echo "== PPTAnim2PDF: generate static PPTX ==" >> conversion-report.txt
+
+            docker run --rm \
+              -v "$PWD:/work" \
+              -v "$RUNNER_TEMP:/runner-temp" \
+              -w /work \
+              "${{ needs.prepare-image.outputs.image }}" \
+              "$INPUT" \
+              --format=pptx \
+              -o /runner-temp/pptanim2pdf-static.pptx \
+              --report="${{ inputs.report }}" \
+              >> conversion-report.txt 2>&1
+
+            STATUS=$?
+
+            if [ "$STATUS" -eq 0 ]; then
+              {
+                echo
+                echo "== office2pdf ${{ steps.office2pdf.outputs.tag }}: generate PDF =="
+              } >> conversion-report.txt
+
+              office2pdf "$STATIC_PPTX" -o "$OUTPUT" \
+                >> conversion-report.txt 2>&1
+
+              STATUS=$?
+            fi
+          else
+            docker run --rm \
+              -v "$PWD:/work" \
+              -w /work \
+              "${{ needs.prepare-image.outputs.image }}" \
+              "$INPUT" \
+              --format=pptx \
+              -o "$OUTPUT" \
+              --report="${{ inputs.report }}" \
+              >> conversion-report.txt 2>&1
+
+            STATUS=$?
+          fi
 
           cat conversion-report.txt
 
@@ -159,9 +232,14 @@ jobs:
             echo
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Input | \`${{ steps.paths.outputs.input }}\` |"
-            echo "| Output | \`${{ steps.paths.outputs.output }}\` |"
-            echo "| Format | \`${{ steps.paths.outputs.format }}\` |"
+            echo "| Input | \`$INPUT\` |"
+            echo "| Output | \`$OUTPUT\` |"
+            echo "| Format | \`$FORMAT\` |"
+
+            if [ "$FORMAT" = "pdf" ]; then
+              echo "| PDF engine | \`office2pdf ${{ steps.office2pdf.outputs.tag }}\` |"
+            fi
+
             echo "| Report level | \`${{ inputs.report }}\` |"
             echo "| Status | \`$STATUS\` |"
             echo
