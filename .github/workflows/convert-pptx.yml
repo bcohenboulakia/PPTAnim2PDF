@@ -108,8 +108,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAG="$(gh release view --repo developer0hye/office2pdf --json tagName --jq '.tagName')"
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-crosextra-carlito
 
+          TAG="$(gh release view --repo developer0hye/office2pdf --json tagName --jq '.tagName')"
           TMP_DIR="$(mktemp -d)"
           trap 'rm -rf "$TMP_DIR"' EXIT
 
