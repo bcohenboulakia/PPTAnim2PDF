@@ -4,35 +4,67 @@
 
 ## Presentation
 
-**PPTAnim2PDF** is a Python script that converts animated presentations into static, shareable PDFs by turning each slide into a sequence of slides showing successive animation states. This script is heavily inspired by [PPspliT](https://www.maxonthenet.altervista.org/ppsplit.php) by Massimo Rimondini (maxonthegit). Many thanks to him; his tool has been invaluable to me over the years.
+**PPTAnim2PDF** is a tool for converting animated PowerPoint presentations into static PPTX files or shareable PDFs. Starting from a `.pptx` presentation, it generates a sequence of static slides showing the successive animation states, preserving the order in which objects and text appear, disappear or change.
 
-The main difference between the two is that PPTAnim2PDF is a standalone script that directly parses and rewrites the `.pptx` OOXML package, using only open-source, cross-platform dependencies. PPspliT takes a different approach: it runs inside PowerPoint and relies on its VBA object model to interpret and transform slides. For standard desktop use, PPspliT remains the safer default, because it stays closer to PowerPoint’s native handling of the file. PPTAnim2PDF is designed for workflows where relying on PowerPoint is undesirable or impossible, such as batch or headless conversion. I created it to automate this conversion step so that I could integrate it into the CI/CD workflow I use to maintain the course materials in my Git repository (see my [nbworkshop repository](https://github.com/bcohenboulakia/nbworkshop)).
+The project combines a Python script that directly reads and rewrites the `.pptx` OOXML package with a GitHub Actions workflow that exports the resulting static presentation to PDF using [office2pdf](https://github.com/developer0hye/office2pdf). The workflow runs entirely on GitHub and does not require PowerPoint or any local installation. The script can also be used independently to generate static PPTX files or, with LibreOffice, PDFs.
 
-PPTAnim2PDF requires Python 3 and `lxml`.
+PPTAnim2PDF is heavily inspired by [PPspliT](https://www.maxonthenet.altervista.org/ppsplit.php) by Massimo Rimondini (maxonthegit). Many thanks to him, his tool has been invaluable to me over the years. PPspliT runs inside PowerPoint and relies on its VBA object model to interpret and transform slides. For standard desktop use, PPspliT remains the safer default, because it stays closer to PowerPoint’s native handling of the file. PPTAnim2PDF takes a different approach, using open-source components that can run without PowerPoint, including in batch or headless workflows. I created it to automate this conversion step in the CI/CD workflow I use to maintain course materials in my Git repository (see my [nbworkshop repository](https://github.com/bcohenboulakia/nbworkshop)).
 
-## Usage
+## Installation and prerequisites
+
+PPTAnim2PDF can be used in two different ways:
+
+- **Using the GitHub workflow:** No local installation is required. The workflow installs its dependencies on a GitHub Actions runner and performs both the animation conversion and PDF export. You only need a GitHub repository containing the script, the workflow and the presentation to convert.
+- **Running the Python script directly:** Python 3 and `lxml` are required. Install the dependency with `python -m pip install lxml`. To generate PDFs directly from the script, LibreOffice must also be installed; it is not needed for static PPTX output.
+
+The two components are located in the `.github` directory:
+
+- `.github/pptanim2pdf/pptanim2pdf.py`: The Python script that converts the animations into static slide states.
+- `.github/workflows/convert-pptx.yml`: The GitHub Actions workflow that runs the script and, for PDF output, converts the static PPTX with office2pdf.
+
+## Quick start
+
+To use the GitHub workflow:
+
+1. Fork the repository, or copy the script and workflow into the corresponding `.github` paths in your own repository.
+2. Add the PowerPoint presentation to the repository and push it to GitHub.
+3. Open the **Actions** tab, select **Convert PPTX**, and click **Run workflow**.
+4. Enter the path of the PPTX file in the repository, choose the output format (`pdf` or `pptx`), and run the workflow.
+
+The generated file is committed to the branch on which the workflow was run. Conversion is currently triggered manually; pushing a presentation does not start it automatically.
+
+Direct use of the script is described in the [Conversion script](#conversion-script) section below.
+
+## GitHub workflow
+
+The GitHub Actions workflow runs on Windows. It first uses the Python script to generate a temporary static PPTX, then uses [office2pdf](https://github.com/developer0hye/office2pdf) to export it to PDF. When `pptx` output is selected, only the Python conversion step is performed. Microsoft PowerPoint and LibreOffice are not required on the runner.
+
+The workflow allows you to specify the input and output paths, output format, and report level. For PDF conversion, the office2pdf version can be selected from the latest `main` commit (the default), the latest release, a specific release tag, or a specific commit SHA. The corresponding source revision and executable hash are recorded in the workflow summary. The generated file is committed back to the selected branch.
+
+PDF fidelity depends on office2pdf. The results are generally good, but some rendering differences with PowerPoint remain. office2pdf is under active development and improves rapidly.
+
+## Conversion script
+
+The Python script can be run independently to generate a static PPTX, with one slide per animation state. It can also export a PDF through LibreOffice in headless mode.
 
 ```bash
-pptanim2pdf.py [-h] [-o OUTPUT] [-f {pptx,pdf}] [--report {none,summary,detail}] [--text-style-width-compensation] input
+python .github/pptanim2pdf/pptanim2pdf.py [-h] [-o OUTPUT] [-f {pptx,pdf}] [--report {none,summary,detail}] [--text-style-width-compensation] input
 ```
 
-Convert an animated PPTX into a static PPTX or PDF with one slide/page per animation state.
-
 - `input`: Input PPTX file.
-- `-h`, `--help`: Show this help message and exit.
+- `-h`, `--help`: Show the help message and exit.
 - `-o OUTPUT`, `--output OUTPUT`: Output file. If omitted, `_split` is appended to the input file name for PPTX output, while PDF output reuses the input stem with the `.pdf` extension.
-- `-f {pptx,pdf}`, `--format {pptx,pdf}`: Output format. `pptx` generates a static PPTX. When running the script directly, `pdf` creates a temporary static PPTX and exports it with LibreOffice in headless mode.
+- `-f {pptx,pdf}`, `--format {pptx,pdf}`: Output format. `pptx` (the default) generates a static PPTX. `pdf` first generates a temporary static PPTX, then exports it using LibreOffice.
 - `--report {none,summary,detail}`, `--report-level {none,summary,detail}`: Controls the conversion report. `none` disables the report, `summary` prints aggregate counts, and `detail` also lists skipped animation steps with the original slide number and the reason why no separate static slide was generated.
+- `--soffice`: Path to the LibreOffice executable, if it is not found automatically (PDF output only).
+- `--pdf-timeout`: Maximum time allowed for LibreOffice PDF export, in seconds (default: 120).
 - `--text-style-width-compensation`: Enables legacy width compensation for text boxes after Bold text-style animations, for renderers that need it. Disabled by default.
-
-The GitHub Actions workflow uses [office2pdf](https://github.com/developer0hye/office2pdf) on Windows for PDF export. PDF fidelity therefore depends on office2pdf. Results are generally good, although rendering differences with PowerPoint remain. office2pdf is under active development and improves rapidly.
 
 ## Compatibility
 
 PPTAnim2PDF is intended for `.pptx` files produced by Microsoft PowerPoint 2007 or later, with best-effort support for recent PowerPoint desktop versions on Windows and macOS. Malformed or inconsistent `.pptx` packages, such as files with missing slide parts or broken slide relationships, are rejected with an explicit error message.
 
 Embedding the fonts used by the presentation in the source PPTX is essential for the closest possible match to the original. Missing fonts may be substituted, changing text metrics, line wrapping, and layout.
-
 
 PPTAnim2PDF directly reads and rewrites the `.pptx` Office Open XML package. The conversion process is developed against the PresentationML structures emitted by Microsoft PowerPoint, with tests currently focused on PowerPoint 2019. Different PowerPoint versions, platforms, or third-party exporters may encode the same animation differently. When such variants are detected but not understood, the converter reports them in the conversion summary instead of silently producing incorrect slides.
 
