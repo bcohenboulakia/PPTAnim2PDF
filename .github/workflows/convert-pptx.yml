@@ -355,7 +355,17 @@ jobs:
           "binary=$binary" >> $env:GITHUB_OUTPUT
           "binary_sha256=$binaryHash" >> $env:GITHUB_OUTPUT
           Write-Host "office2pdf executable SHA-256: $binaryHash"
-
+          
+      - name: Publish office2pdf executable
+        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        uses: actions/upload-artifact@v4
+        with:
+          name: office2pdf-windows-x64
+          path: ${{ steps.office2pdf.outputs.binary }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          
       - name: Convert presentation
         id: convert
         shell: pwsh
