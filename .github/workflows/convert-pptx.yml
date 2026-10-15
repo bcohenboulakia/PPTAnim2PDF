@@ -28,6 +28,21 @@ on:
           - none
           - summary
           - detail
+      office2pdf_mode:
+        description: "office2pdf source (PDF only)"
+        required: true
+        default: latest-main
+        type: choice
+        options:
+          - latest-main
+          - latest-release
+          - release-tag
+          - commit-sha
+      office2pdf_ref:
+        description: "Release tag or full commit SHA for pinned modes (PDF only)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -39,6 +54,31 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Validate office2pdf selection
+        if: inputs.format == 'pdf'
+        shell: pwsh
+        env:
+          OFFICE2PDF_MODE: ${{ inputs.office2pdf_mode }}
+          OFFICE2PDF_REF: ${{ inputs.office2pdf_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mode = $env:OFFICE2PDF_MODE
+          $ref = $env:OFFICE2PDF_REF.Trim()
+          $pinned = $mode -in @('release-tag', 'commit-sha')
+
+          if ($pinned -and -not $ref) {
+            throw "office2pdf_ref is required when office2pdf_mode is '$mode'."
+          }
+          if ($mode -eq 'release-tag' -and $ref -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+            throw 'Invalid office2pdf release tag (allowed: letters, digits, dot, underscore, hyphen).'
+          }
+          if ($mode -eq 'commit-sha' -and $ref -notmatch '^[0-9a-fA-F]{40}$') {
+            throw 'office2pdf_ref must be a full 40-character hexadecimal commit SHA.'
+          }
+          if (-not $pinned -and $ref) {
+            Write-Host '::warning::office2pdf_ref is ignored for the selected automatic mode.'
+          }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -181,38 +221,140 @@ jobs:
             "`n### Font availability`n`nFont audit could not be completed: $($_.Exception.Message)`n" >> $env:GITHUB_STEP_SUMMARY
           }
 
-      - name: Install latest office2pdf (Windows)
+      - name: Resolve office2pdf revision
+        if: inputs.format == 'pdf'
+        id: office2pdf-revision
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OFFICE2PDF_MODE: ${{ inputs.office2pdf_mode }}
+          OFFICE2PDF_REF: ${{ inputs.office2pdf_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mode = $env:OFFICE2PDF_MODE
+          $ref = $env:OFFICE2PDF_REF.Trim()
+          $tag = ''
+          $sha = ''
+
+          switch ($mode) {
+            'latest-release' {
+              # GitHub's /releases/latest endpoint excludes drafts and prereleases.
+              $tag = gh api 'repos/developer0hye/office2pdf/releases/latest' --jq '.tag_name'
+              if ($LASTEXITCODE -ne 0 -or -not $tag) { throw 'Cannot resolve latest stable office2pdf release.' }
+            }
+            'release-tag' {
+              # Unlike latest-release, an explicitly requested tag may be a prerelease.
+              $tag = gh api "repos/developer0hye/office2pdf/releases/tags/$ref" --jq '.tag_name'
+              if ($LASTEXITCODE -ne 0 -or -not $tag) { throw "office2pdf release not found: $ref" }
+            }
+            'latest-main' {
+              # Freeze HEAD now. Any later push to upstream main cannot change this run.
+              $line = git ls-remote https://github.com/developer0hye/office2pdf.git refs/heads/main
+              if ($LASTEXITCODE -ne 0 -or -not $line) { throw 'Cannot resolve upstream office2pdf main.' }
+              $sha = ($line -split '\s+')[0]
+            }
+            'commit-sha' {
+              $sha = $ref.ToLowerInvariant()
+            }
+            default { throw "Unknown office2pdf mode: $mode" }
+          }
+
+          if ($tag) { $tag = "$tag".Trim() }
+          if ($sha -and $sha -notmatch '^[0-9a-fA-F]{40}$') { throw "Invalid resolved commit SHA: $sha" }
+          $identity = if ($tag) { $tag } else { $sha }
+          if (-not $identity) { throw 'office2pdf version resolution returned an empty result.' }
+
+          "mode=$mode" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "identity=$identity" >> $env:GITHUB_OUTPUT
+          Write-Host "office2pdf: $mode => $identity"
+
+      - name: Fetch office2pdf source at exact commit
+        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        shell: pwsh
+        env:
+          OFFICE2PDF_SHA: ${{ steps.office2pdf-revision.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:RUNNER_TEMP 'office2pdf-source'
+          New-Item -ItemType Directory -Force -Path $source | Out-Null
+          git -C "$source" init -q
+          if ($LASTEXITCODE -ne 0) { throw 'Could not initialize office2pdf source checkout.' }
+          git -C "$source" remote add origin https://github.com/developer0hye/office2pdf.git
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure office2pdf upstream.' }
+          git -C "$source" fetch --no-tags --depth 1 origin "$env:OFFICE2PDF_SHA"
+          if ($LASTEXITCODE -ne 0) { throw "office2pdf commit cannot be fetched: $env:OFFICE2PDF_SHA" }
+          git -C "$source" -c advice.detachedHead=false checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not check out selected office2pdf commit.' }
+          $actual = (git -C "$source" rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:OFFICE2PDF_SHA) {
+            throw "office2pdf commit mismatch: expected $env:OFFICE2PDF_SHA, got $actual"
+          }
+          Write-Host "Checked out office2pdf commit $actual"
+
+      - name: Set up Rust
+        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies and builds
+        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ runner.temp }}/office2pdf-source -> target
+          prefix-key: office2pdf-upstream
+
+      - name: Install selected office2pdf (Windows)
         if: inputs.format == 'pdf'
         id: office2pdf
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          OFFICE2PDF_MODE: ${{ steps.office2pdf-revision.outputs.mode }}
+          OFFICE2PDF_TAG: ${{ steps.office2pdf-revision.outputs.tag }}
+          OFFICE2PDF_SHA: ${{ steps.office2pdf-revision.outputs.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = gh release view --repo developer0hye/office2pdf --json tagName --jq '.tagName'
-          if ($LASTEXITCODE -ne 0 -or -not $tag) { throw 'Cannot resolve latest office2pdf release.' }
-
-          $downloadDir = Join-Path $env:RUNNER_TEMP 'office2pdf-download'
-          $extractDir = Join-Path $env:RUNNER_TEMP 'office2pdf-extracted'
-          New-Item -ItemType Directory -Force -Path $downloadDir, $extractDir | Out-Null
-
-          gh release download "$tag" --repo developer0hye/office2pdf --pattern '*x86_64-pc-windows-msvc.zip' --dir "$downloadDir"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to download office2pdf $tag for Windows x64." }
-          $archive = @(Get-ChildItem -LiteralPath $downloadDir -Filter '*x86_64-pc-windows-msvc.zip' -File)
-          if ($archive.Count -ne 1) { throw "Expected one Windows archive, found $($archive.Count)." }
-          Expand-Archive -LiteralPath $archive[0].FullName -DestinationPath $extractDir -Force
-          $binaries = @(Get-ChildItem -LiteralPath $extractDir -Filter 'office2pdf.exe' -File -Recurse)
-          if ($binaries.Count -ne 1) { throw "Expected one office2pdf.exe, found $($binaries.Count)." }
-
           $binDir = Join-Path $env:RUNNER_TEMP 'office2pdf-bin'
           New-Item -ItemType Directory -Force -Path $binDir | Out-Null
           $binary = Join-Path $binDir 'office2pdf.exe'
-          Copy-Item -LiteralPath $binaries[0].FullName -Destination $binary -Force
 
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "binary=$binary" >> $env:GITHUB_OUTPUT
+          if ($env:OFFICE2PDF_MODE -in @('latest-release', 'release-tag')) {
+            $tag = $env:OFFICE2PDF_TAG
+            $downloadDir = Join-Path $env:RUNNER_TEMP 'office2pdf-download'
+            $extractDir = Join-Path $env:RUNNER_TEMP 'office2pdf-extracted'
+            New-Item -ItemType Directory -Force -Path $downloadDir, $extractDir | Out-Null
+
+            gh release download "$tag" --repo developer0hye/office2pdf --pattern '*x86_64-pc-windows-msvc.zip' --dir "$downloadDir"
+            if ($LASTEXITCODE -ne 0) { throw "Cannot download official office2pdf release $tag." }
+            $archives = @(Get-ChildItem -LiteralPath $downloadDir -Filter '*x86_64-pc-windows-msvc.zip' -File)
+            if ($archives.Count -ne 1) { throw "Expected one Windows release archive, found $($archives.Count)." }
+            Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath $extractDir -Force
+            $executables = @(Get-ChildItem -LiteralPath $extractDir -Filter 'office2pdf.exe' -File -Recurse)
+            if ($executables.Count -ne 1) { throw "Expected one office2pdf.exe, found $($executables.Count)." }
+            Copy-Item -LiteralPath $executables[0].FullName -Destination $binary -Force
+          } else {
+            $source = Join-Path $env:RUNNER_TEMP 'office2pdf-source'
+            Push-Location $source
+            try {
+              cargo build --release --locked -p office2pdf-cli
+              if ($LASTEXITCODE -ne 0) { throw "office2pdf compilation failed ($LASTEXITCODE)." }
+            } finally {
+              Pop-Location
+            }
+            $compiled = Join-Path $source 'target/release/office2pdf.exe'
+            if (-not (Test-Path -LiteralPath $compiled -PathType Leaf)) {
+              throw "Compiled office2pdf.exe not found: $compiled"
+            }
+            Copy-Item -LiteralPath $compiled -Destination $binary -Force
+          }
+
           & $binary --version
           if ($LASTEXITCODE -ne 0) { throw 'office2pdf executable could not start.' }
+          $binaryHash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          "binary=$binary" >> $env:GITHUB_OUTPUT
+          "binary_sha256=$binaryHash" >> $env:GITHUB_OUTPUT
+          Write-Host "office2pdf executable SHA-256: $binaryHash"
 
       - name: Convert presentation
         id: convert
@@ -223,7 +365,7 @@ jobs:
           OUTPUT_FORMAT: ${{ steps.paths.outputs.format }}
           REPORT_LEVEL: ${{ inputs.report }}
           OFFICE2PDF_EXE: ${{ steps.office2pdf.outputs.binary }}
-          OFFICE2PDF_TAG: ${{ steps.office2pdf.outputs.tag }}
+          OFFICE2PDF_IDENTITY: ${{ steps.office2pdf-revision.outputs.identity }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
@@ -236,7 +378,7 @@ jobs:
             & python .github/pptanim2pdf/pptanim2pdf.py "$env:INPUT_PATH" --format=pptx -o "$staticPptx" "--report=$env:REPORT_LEVEL" 2>&1 | Tee-Object -FilePath $reportPath -Append
             if ($LASTEXITCODE -ne 0) { throw "PPTAnim2PDF failed ($LASTEXITCODE)." }
 
-            "== office2pdf $($env:OFFICE2PDF_TAG): generate PDF ==" | Tee-Object -FilePath $reportPath -Append
+            "== office2pdf $($env:OFFICE2PDF_IDENTITY): generate PDF ==" | Tee-Object -FilePath $reportPath -Append
             & "$env:OFFICE2PDF_EXE" "$staticPptx" -o "$env:OUTPUT_PATH" 2>&1 | Tee-Object -FilePath $reportPath -Append
             if ($LASTEXITCODE -ne 0) { throw "office2pdf failed ($LASTEXITCODE)." }
           } else {
@@ -251,7 +393,11 @@ jobs:
           INPUT_PATH: ${{ steps.paths.outputs.input }}
           OUTPUT_PATH: ${{ steps.paths.outputs.output }}
           OUTPUT_FORMAT: ${{ steps.paths.outputs.format }}
-          OFFICE2PDF_TAG: ${{ steps.office2pdf.outputs.tag }}
+          OFFICE2PDF_MODE: ${{ steps.office2pdf-revision.outputs.mode }}
+          OFFICE2PDF_TAG: ${{ steps.office2pdf-revision.outputs.tag }}
+          OFFICE2PDF_SHA: ${{ steps.office2pdf-revision.outputs.sha }}
+          OFFICE2PDF_IDENTITY: ${{ steps.office2pdf-revision.outputs.identity }}
+          OFFICE2PDF_BINARY_SHA256: ${{ steps.office2pdf.outputs.binary_sha256 }}
           REPORT_LEVEL: ${{ inputs.report }}
           CONVERSION_OUTCOME: ${{ steps.convert.outcome }}
         run: |
@@ -261,7 +407,17 @@ jobs:
           "| Output | ``$env:OUTPUT_PATH`` |" >> $env:GITHUB_STEP_SUMMARY
           "| Format | ``$env:OUTPUT_FORMAT`` |" >> $env:GITHUB_STEP_SUMMARY
           if ($env:OUTPUT_FORMAT -eq 'pdf') {
-            "| PDF engine | ``office2pdf $env:OFFICE2PDF_TAG`` (Windows) |" >> $env:GITHUB_STEP_SUMMARY
+            "| PDF engine | ``office2pdf`` (Windows) |" >> $env:GITHUB_STEP_SUMMARY
+            "| office2pdf mode | ``$env:OFFICE2PDF_MODE`` |" >> $env:GITHUB_STEP_SUMMARY
+            if ($env:OFFICE2PDF_TAG) {
+              "| Release tag | ``$env:OFFICE2PDF_TAG`` |" >> $env:GITHUB_STEP_SUMMARY
+            }
+            if ($env:OFFICE2PDF_SHA) {
+              "| Source commit SHA | ``$env:OFFICE2PDF_SHA`` |" >> $env:GITHUB_STEP_SUMMARY
+            }
+            if ($env:OFFICE2PDF_BINARY_SHA256) {
+              "| Executable SHA-256 | ``$env:OFFICE2PDF_BINARY_SHA256`` |" >> $env:GITHUB_STEP_SUMMARY
+            }
           }
           "| Report level | ``$env:REPORT_LEVEL`` |" >> $env:GITHUB_STEP_SUMMARY
           "| Status | ``$env:CONVERSION_OUTCOME`` |`n" >> $env:GITHUB_STEP_SUMMARY
