@@ -378,6 +378,40 @@ def final_point_from_motion_path(path):
 
     return last_point[0] - start[0], last_point[1] - start[1]
 
+def motion_path_final_offset(anim_motion):
+    """Absolute final motion offset for paths anchored to the slide layout.
+
+    Uppercase path commands in a layout-origin animation describe offsets in
+    slide fractions relative to the target's unanimated position. A later path
+    for the same object can begin at the preceding path's endpoint. Therefore
+    its contribution is (new endpoint - previous endpoint), rather than
+    (new endpoint - its own M point).
+
+    Return None for other encodings: the existing displacement parser handles
+    those conservatively until their coordinate frames are verified.
+    """
+    if anim_motion.get("origin") != "layout":
+        return None
+
+    path = anim_motion.get("path", "")
+    tokens = parse_motion_path_numbers(path)
+    if not tokens or tokens[0] != "M":
+        return None
+
+    # Lowercase commands are relative to the current path point. Their
+    # positioning convention is intentionally not inferred here.
+    if any(token in {"m", "l", "c", "z", "e"} for token in tokens):
+        return None
+
+    try:
+        # Existing parser returns (last - first); recover the final offset by
+        # adding the starting point, including any nonzero M coordinates.
+        displacement = final_point_from_motion_path(path)
+        return (float(tokens[1]) + displacement[0],
+                float(tokens[2]) + displacement[1])
+    except (ValueError, IndexError, TypeError):
+        return None
+
 def motion_delta_from_anim_motion(anim_motion, slide_width, slide_height):
     """
     Convert a p:animMotion element to an EMU displacement.
@@ -1282,6 +1316,8 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
     step = 0
     pending_next_click_events = []
     all_at_once_shapes = all_at_once_build_shape_ids(slide_root)
+    # Final layout-relative offsets of prior motion paths, per shape.
+    motion_offsets = {}
 
     def count_skip(skip_reason):
         if report is not None and skip_reason in report:
@@ -1414,10 +1450,18 @@ def extract_timeline_events(slide_root, slide_width, slide_height, report=None):
                     continue
 
                 current_step = ensure_step_for_ctn()
-                dx, dy = delta
+                path_endpoint = motion_path_final_offset(anim_node)
 
                 for target in targets:
                     target = shape_level_target(target)
+                    dx, dy = delta
+
+                    if path_endpoint is not None:
+                        sid = target[1]
+                        previous = motion_offsets.get(sid, (0.0, 0.0))
+                        dx = int(round((path_endpoint[0] - previous[0]) * slide_width))
+                        dy = int(round((path_endpoint[1] - previous[1]) * slide_height))
+                        motion_offsets[sid] = path_endpoint
 
                     events.append(
                         {
@@ -2995,7 +3039,7 @@ def apply_timeline_event(
     shape_style_state,
     post_step_events=None,
     color_post_mode=False,
-    text_style_width_compensation=True,
+    text_style_width_compensation=False,
 ):
     """
     Apply one event to the current slide state.
@@ -3229,7 +3273,7 @@ def apply_timeline_events(
     shape_style_state,
     force_emit=False,
     skipped_event_details=None,
-    text_style_width_compensation=True,
+    text_style_width_compensation=False,
 ):
     """
     Apply the events of one step in order.
@@ -3600,7 +3644,7 @@ def split_pptx_static(
     report_level="summary",
     report_output_path=None,
     print_report=True,
-    text_style_width_compensation=True,
+    text_style_width_compensation=False,
 ):
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -4020,7 +4064,7 @@ def convert_presentation(
     report_level="summary",
     soffice=None,
     pdf_timeout=120,
-    text_style_width_compensation=True,
+    text_style_width_compensation=False,
 ):
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -4145,14 +4189,21 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--text-style-width-compensation",
+        action="store_true",
+        dest="text_style_width_compensation",
+        default=False,
+        help=(
+            "Enable legacy 6%% text-box width compensation after Bold animations "
+            "(use only for renderers that need it)."
+        ),
+    )
+
+    parser.add_argument(
         "--no-text-style-width-compensation",
         action="store_false",
         dest="text_style_width_compensation",
-        default=True,
-        help=(
-            "Disable the text-box width compensation applied by default after "
-            "Bold text-style animations."
-        ),
+        help="Explicitly disable legacy Bold text-box width compensation (default).",
     )
 
     args = parser.parse_args()
