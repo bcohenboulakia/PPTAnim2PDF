@@ -268,10 +268,21 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "sha=$sha" >> $env:GITHUB_OUTPUT
           "identity=$identity" >> $env:GITHUB_OUTPUT
+          $cacheId = if ($sha) { "sha-$sha" } else { "tag-$tag" }
+          "cache_key=office2pdf-win2022-x64-v1-$cacheId" >> $env:GITHUB_OUTPUT
           Write-Host "office2pdf: $mode => $identity"
 
+      - name: Restore cached office2pdf executable
+        if: inputs.format == 'pdf'
+        id: office2pdf-binary-cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/office2pdf-bin/office2pdf.exe
+          key: ${{ steps.office2pdf-revision.outputs.cache_key }}
+
       - name: Fetch office2pdf source at exact commit
-        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
         shell: pwsh
         env:
           OFFICE2PDF_SHA: ${{ steps.office2pdf-revision.outputs.sha }}
@@ -294,11 +305,11 @@ jobs:
           Write-Host "Checked out office2pdf commit $actual"
 
       - name: Set up Rust
-        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust dependencies and builds
-        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ runner.temp }}/office2pdf-source -> target
@@ -313,13 +324,19 @@ jobs:
           OFFICE2PDF_MODE: ${{ steps.office2pdf-revision.outputs.mode }}
           OFFICE2PDF_TAG: ${{ steps.office2pdf-revision.outputs.tag }}
           OFFICE2PDF_SHA: ${{ steps.office2pdf-revision.outputs.sha }}
+          OFFICE2PDF_CACHE_HIT: ${{ steps.office2pdf-binary-cache.outputs.cache-hit }}
         run: |
           $ErrorActionPreference = 'Stop'
           $binDir = Join-Path $env:RUNNER_TEMP 'office2pdf-bin'
           New-Item -ItemType Directory -Force -Path $binDir | Out-Null
           $binary = Join-Path $binDir 'office2pdf.exe'
 
-          if ($env:OFFICE2PDF_MODE -in @('latest-release', 'release-tag')) {
+          if ($env:OFFICE2PDF_CACHE_HIT -eq 'true') {
+            if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+              throw 'Cache reported a hit but office2pdf.exe is missing.'
+            }
+            Write-Host "::notice::Reusing cached office2pdf executable ($($env:OFFICE2PDF_SHA)$($env:OFFICE2PDF_TAG))"
+          } elseif ($env:OFFICE2PDF_MODE -in @('latest-release', 'release-tag')) {
             $tag = $env:OFFICE2PDF_TAG
             $downloadDir = Join-Path $env:RUNNER_TEMP 'office2pdf-download'
             $extractDir = Join-Path $env:RUNNER_TEMP 'office2pdf-extracted'
@@ -354,7 +371,26 @@ jobs:
           $binaryHash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
           "binary=$binary" >> $env:GITHUB_OUTPUT
           "binary_sha256=$binaryHash" >> $env:GITHUB_OUTPUT
+          "cache_hit=$($env:OFFICE2PDF_CACHE_HIT -eq 'true')" >> $env:GITHUB_OUTPUT
           Write-Host "office2pdf executable SHA-256: $binaryHash"
+
+      - name: Save office2pdf executable to cache
+        if: inputs.format == 'pdf' && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/office2pdf-bin/office2pdf.exe
+          key: ${{ steps.office2pdf-binary-cache.outputs.cache-primary-key }}
+
+      - name: Publish office2pdf executable
+        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        uses: actions/upload-artifact@v4
+        with:
+          name: office2pdf-windows-x64
+          path: ${{ steps.office2pdf.outputs.binary }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
       - name: Convert presentation
         id: convert
@@ -398,6 +434,7 @@ jobs:
           OFFICE2PDF_SHA: ${{ steps.office2pdf-revision.outputs.sha }}
           OFFICE2PDF_IDENTITY: ${{ steps.office2pdf-revision.outputs.identity }}
           OFFICE2PDF_BINARY_SHA256: ${{ steps.office2pdf.outputs.binary_sha256 }}
+          OFFICE2PDF_CACHE_HIT: ${{ steps.office2pdf.outputs.cache_hit }}
           REPORT_LEVEL: ${{ inputs.report }}
           CONVERSION_OUTCOME: ${{ steps.convert.outcome }}
         run: |
@@ -418,6 +455,7 @@ jobs:
             if ($env:OFFICE2PDF_BINARY_SHA256) {
               "| Executable SHA-256 | ``$env:OFFICE2PDF_BINARY_SHA256`` |" >> $env:GITHUB_STEP_SUMMARY
             }
+            "| Executable cache hit | ``$env:OFFICE2PDF_CACHE_HIT`` |" >> $env:GITHUB_STEP_SUMMARY
           }
           "| Report level | ``$env:REPORT_LEVEL`` |" >> $env:GITHUB_STEP_SUMMARY
           "| Status | ``$env:CONVERSION_OUTCOME`` |`n" >> $env:GITHUB_STEP_SUMMARY
