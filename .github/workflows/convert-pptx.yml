@@ -1,6 +1,14 @@
 name: Convert PPTX
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '**.pptx'
+      - '.github/pptanim2pdf/**'
+      - '.github/scripts/pptanim2pdf_plan.py'
+      - '.github/scripts/publish_outputs.py'
+      - '.github/workflows/convert-pptx.yml'
   workflow_dispatch:
     inputs:
       input:
@@ -48,19 +56,63 @@ permissions:
   contents: write
 
 jobs:
+  select:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      removed_matrix: ${{ steps.plan.outputs.removed_matrix }}
+      has_conversions: ${{ steps.plan.outputs.has_conversions }}
+      has_removals: ${{ steps.plan.outputs.has_removals }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      format: ${{ inputs.format || 'pdf' }}
+      report: ${{ inputs.report || 'summary' }}
+      office2pdf_mode: ${{ inputs.office2pdf_mode || 'latest-release' }}
+      office2pdf_ref: ${{ inputs.office2pdf_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || 'main' }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Select changed presentations
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          INPUT_PATH: ${{ inputs.input }}
+          OUTPUT_PATH: ${{ inputs.output }}
+        run: |
+          python .github/scripts/pptanim2pdf_plan.py --event "$EVENT_NAME" --before "$BEFORE" --input "$INPUT_PATH" --output "$OUTPUT_PATH"
+
   convert:
+    needs: select
+    if: needs.select.outputs.has_conversions == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    concurrency:
+      group: pptanim2pdf-Students-${{ matrix.input }}
+      cancel-in-progress: false
     runs-on: windows-2022
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.source_sha }}
+          fetch-depth: 0
 
       - name: Validate office2pdf selection
-        if: inputs.format == 'pdf'
+        if: needs.select.outputs.format == 'pdf'
         shell: pwsh
         env:
-          OFFICE2PDF_MODE: ${{ inputs.office2pdf_mode }}
-          OFFICE2PDF_REF: ${{ inputs.office2pdf_ref }}
+          OFFICE2PDF_MODE: ${{ needs.select.outputs.office2pdf_mode }}
+          OFFICE2PDF_REF: ${{ needs.select.outputs.office2pdf_ref }}
         run: |
           $ErrorActionPreference = 'Stop'
           $mode = $env:OFFICE2PDF_MODE
@@ -93,9 +145,9 @@ jobs:
         id: paths
         shell: pwsh
         env:
-          INPUT_PATH: ${{ inputs.input }}
-          OUTPUT_PATH: ${{ inputs.output }}
-          OUTPUT_FORMAT: ${{ inputs.format }}
+          INPUT_PATH: ${{ matrix.input }}
+          OUTPUT_PATH: ${{ matrix.output }}
+          OUTPUT_FORMAT: ${{ needs.select.outputs.format }}
         run: |
           $ErrorActionPreference = 'Stop'
           $inputFile = $env:INPUT_PATH
@@ -111,7 +163,9 @@ jobs:
             } else {
               $directory = Split-Path -Parent $inputFile
               if (-not $directory) { $directory = '.' }
-              $outputFile = Join-Path $directory (([IO.Path]::GetFileNameWithoutExtension($inputFile)) + '_split.pptx')
+              $stem = [IO.Path]::GetFileNameWithoutExtension($inputFile)
+              $stem = if ($stem -match '_(fr|en)$') { $stem -replace '_(fr|en)$', '_split_$1' } else { $stem + '_split' }
+              $outputFile = Join-Path $directory ($stem + '.pptx')
             }
           }
           if ([IO.Path]::GetFullPath($inputFile) -eq [IO.Path]::GetFullPath($outputFile)) {
@@ -120,13 +174,14 @@ jobs:
           $parent = Split-Path -Parent $outputFile
           if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
 
+          $outputFile = $outputFile.Replace('\', '/')
           "input=$inputFile" >> $env:GITHUB_OUTPUT
           "output=$outputFile" >> $env:GITHUB_OUTPUT
           "format=$format" >> $env:GITHUB_OUTPUT
           Write-Host "Input: $inputFile | Output: $outputFile | Format: $format"
 
       - name: Check fonts on Windows runner
-        if: inputs.format == 'pdf'
+        if: needs.select.outputs.format == 'pdf'
         shell: pwsh
         env:
           INPUT_PATH: ${{ steps.paths.outputs.input }}
@@ -222,13 +277,13 @@ jobs:
           }
 
       - name: Resolve office2pdf revision
-        if: inputs.format == 'pdf'
+        if: needs.select.outputs.format == 'pdf'
         id: office2pdf-revision
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          OFFICE2PDF_MODE: ${{ inputs.office2pdf_mode }}
-          OFFICE2PDF_REF: ${{ inputs.office2pdf_ref }}
+          OFFICE2PDF_MODE: ${{ needs.select.outputs.office2pdf_mode }}
+          OFFICE2PDF_REF: ${{ needs.select.outputs.office2pdf_ref }}
         run: |
           $ErrorActionPreference = 'Stop'
           $mode = $env:OFFICE2PDF_MODE
@@ -273,7 +328,7 @@ jobs:
           Write-Host "office2pdf: $mode => $identity"
 
       - name: Restore cached office2pdf executable
-        if: inputs.format == 'pdf'
+        if: needs.select.outputs.format == 'pdf'
         id: office2pdf-binary-cache
         uses: actions/cache/restore@v4
         continue-on-error: true
@@ -282,7 +337,7 @@ jobs:
           key: ${{ steps.office2pdf-revision.outputs.cache_key }}
 
       - name: Fetch office2pdf source at exact commit
-        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
+        if: needs.select.outputs.format == 'pdf' && (needs.select.outputs.office2pdf_mode == 'latest-main' || needs.select.outputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
         shell: pwsh
         env:
           OFFICE2PDF_SHA: ${{ steps.office2pdf-revision.outputs.sha }}
@@ -305,18 +360,18 @@ jobs:
           Write-Host "Checked out office2pdf commit $actual"
 
       - name: Set up Rust
-        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
+        if: needs.select.outputs.format == 'pdf' && (needs.select.outputs.office2pdf_mode == 'latest-main' || needs.select.outputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust dependencies and builds
-        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
+        if: needs.select.outputs.format == 'pdf' && (needs.select.outputs.office2pdf_mode == 'latest-main' || needs.select.outputs.office2pdf_mode == 'commit-sha') && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ runner.temp }}/office2pdf-source -> target
           prefix-key: office2pdf-upstream
 
       - name: Install selected office2pdf (Windows)
-        if: inputs.format == 'pdf'
+        if: needs.select.outputs.format == 'pdf'
         id: office2pdf
         shell: pwsh
         env:
@@ -375,7 +430,7 @@ jobs:
           Write-Host "office2pdf executable SHA-256: $binaryHash"
 
       - name: Save office2pdf executable to cache
-        if: inputs.format == 'pdf' && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
+        if: needs.select.outputs.format == 'pdf' && steps.office2pdf-binary-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         continue-on-error: true
         with:
@@ -383,10 +438,10 @@ jobs:
           key: ${{ steps.office2pdf-binary-cache.outputs.cache-primary-key }}
 
       - name: Publish office2pdf executable
-        if: inputs.format == 'pdf' && (inputs.office2pdf_mode == 'latest-main' || inputs.office2pdf_mode == 'commit-sha')
+        if: needs.select.outputs.format == 'pdf' && (needs.select.outputs.office2pdf_mode == 'latest-main' || needs.select.outputs.office2pdf_mode == 'commit-sha')
         uses: actions/upload-artifact@v4
         with:
-          name: office2pdf-windows-x64
+          name: office2pdf-windows-x64-${{ strategy.job-index }}
           path: ${{ steps.office2pdf.outputs.binary }}
           if-no-files-found: error
           retention-days: 7
@@ -399,7 +454,7 @@ jobs:
           INPUT_PATH: ${{ steps.paths.outputs.input }}
           OUTPUT_PATH: ${{ steps.paths.outputs.output }}
           OUTPUT_FORMAT: ${{ steps.paths.outputs.format }}
-          REPORT_LEVEL: ${{ inputs.report }}
+          REPORT_LEVEL: ${{ needs.select.outputs.report }}
           OFFICE2PDF_EXE: ${{ steps.office2pdf.outputs.binary }}
           OFFICE2PDF_IDENTITY: ${{ steps.office2pdf-revision.outputs.identity }}
         run: |
@@ -435,12 +490,13 @@ jobs:
           OFFICE2PDF_IDENTITY: ${{ steps.office2pdf-revision.outputs.identity }}
           OFFICE2PDF_BINARY_SHA256: ${{ steps.office2pdf.outputs.binary_sha256 }}
           OFFICE2PDF_CACHE_HIT: ${{ steps.office2pdf.outputs.cache_hit }}
-          REPORT_LEVEL: ${{ inputs.report }}
+          REPORT_LEVEL: ${{ needs.select.outputs.report }}
           CONVERSION_OUTCOME: ${{ steps.convert.outcome }}
         run: |
           "`n### PPTAnim2PDF conversion`n" >> $env:GITHUB_STEP_SUMMARY
           "| Field | Value |`n|---|---|" >> $env:GITHUB_STEP_SUMMARY
           "| Input | ``$env:INPUT_PATH`` |" >> $env:GITHUB_STEP_SUMMARY
+          "| Source commit | ``$(git rev-parse HEAD)`` |" >> $env:GITHUB_STEP_SUMMARY
           "| Output | ``$env:OUTPUT_PATH`` |" >> $env:GITHUB_STEP_SUMMARY
           "| Format | ``$env:OUTPUT_FORMAT`` |" >> $env:GITHUB_STEP_SUMMARY
           if ($env:OUTPUT_FORMAT -eq 'pdf') {
@@ -466,24 +522,41 @@ jobs:
             '```' >> $env:GITHUB_STEP_SUMMARY
           }
 
-      - name: Commit generated file
+      - name: Publish generated file on Students
         shell: pwsh
         env:
           OUTPUT_PATH: ${{ steps.paths.outputs.output }}
         run: |
-          if (-not (Test-Path -LiteralPath $env:OUTPUT_PATH -PathType Leaf)) {
-            throw "Generated file not found: $env:OUTPUT_PATH"
-          }
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add -- "$env:OUTPUT_PATH"
-          git diff --cached --quiet
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "No changes to commit for $env:OUTPUT_PATH."
-            exit 0
-          }
-          if ($LASTEXITCODE -ne 1) { throw "git diff failed ($LASTEXITCODE)." }
-          git commit -m 'Generate converted presentation'
-          if ($LASTEXITCODE -ne 0) { throw 'git commit failed.' }
-          git push origin "HEAD:$env:GITHUB_REF_NAME"
-          if ($LASTEXITCODE -ne 0) { throw 'git push failed.' }
+          $ErrorActionPreference = 'Stop'
+          python .github/scripts/publish_outputs.py --file "$env:OUTPUT_PATH" --branch Students --message 'Update converted presentation'
+          if ($LASTEXITCODE -ne 0) { throw 'Presentation publication failed.' }
+
+      - name: Save converted presentation for verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: converted-presentation-${{ strategy.job-index }}
+          path: ${{ steps.paths.outputs.output }}
+          if-no-files-found: error
+          retention-days: 7
+
+  remove_deleted:
+    needs: select
+    if: needs.select.outputs.has_removals == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.select.outputs.removed_matrix) }}
+    concurrency:
+      group: pptanim2pdf-Students-${{ matrix.input }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.source_sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Remove only the deleted presentation's PDF
+        env:
+          OUTPUT_PATH: ${{ matrix.output }}
+        run: python .github/scripts/publish_outputs.py --remove "$OUTPUT_PATH" --branch Students --message 'Remove obsolete presentation PDF'
